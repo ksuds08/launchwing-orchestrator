@@ -1,4 +1,4 @@
-// Cloudflare Workers deploy helpers — classic Scripts API (single upload, workers_dev enabled)
+// Cloudflare Workers deploy helpers — Services API with workers_dev + health check
 
 export interface DeployResult {
   ok: boolean;
@@ -6,8 +6,6 @@ export interface DeployResult {
   url?: string;
   deploymentId?: string;
   error?: string;
-  status?: number;
-  endpoint?: string;
 }
 
 interface EnvLike {
@@ -16,30 +14,17 @@ interface EnvLike {
   CF_WORKERS_SUBDOMAIN?: string;
 }
 
-async function cf(
-  token: string,
-  url: string,
-  init: RequestInit
-): Promise<{ ok: boolean; status: number; json: any }> {
+async function cf(token: string, url: string, init: RequestInit) {
   const res = await fetch(url, {
     ...init,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      ...(init.headers || {}),
-    },
+    headers: { Authorization: `Bearer ${token}`, ...(init.headers || {}) },
   });
   const json = await res.json().catch(() => ({}));
   return { ok: res.ok, status: res.status, json };
 }
 
-/**
- * Upload a single-file **Module Worker** using the classic Scripts API.
- * We embed `workers_dev: true` in the metadata so the script is reachable at
- * https://<name>.<subdomain>.workers.dev/ immediately after upload.
- * Requires API token with "Workers Scripts: Edit".
- */
 export async function uploadModuleWorker(
-  scriptName: string,
+  serviceName: string,
   code: string,
   env: EnvLike
 ): Promise<DeployResult> {
@@ -47,41 +32,65 @@ export async function uploadModuleWorker(
   const accountId = env.CLOUDFLARE_ACCOUNT_ID;
   const subdomain = env.CF_WORKERS_SUBDOMAIN;
 
-  if (!token || !accountId) {
-    return { ok: false, error: "Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID" };
+  if (!token || !accountId) return { ok: false, error: "Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID" };
+
+  const base = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/services/${encodeURIComponent(serviceName)}`;
+
+  // 1) Ensure service exists (idempotent)
+  {
+    const r = await cf(token, base, { method: "PUT" });
+    if (!r.ok && r.status !== 409) return { ok: false, error: r.json?.errors?.[0]?.message || `Create service failed (${r.status})` };
   }
 
-  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(
-    scriptName
-  )}`;
+  // 2) Upload module to production
+  {
+    const metadata = { main_module: "index.js", compatibility_date: "2024-11-01" };
+    const fd = new FormData();
+    fd.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
+    fd.append("index.js", new Blob([code], { type: "application/javascript+module" }), "index.js");
 
-  // ── Multipart payload: metadata + main module
-  // NOTE: include workers_dev here (important!)
-  const metadata = {
-    main_module: "index.js",
-    compatibility_date: "2024-11-01",
-    workers_dev: true,             // ← enables <name>.<subdomain>.workers.dev
-  };
-
-  const fd = new FormData();
-  fd.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
-  fd.append("index.js", new Blob([code], { type: "application/javascript+module" }), "index.js");
-
-  const { ok, status, json } = await cf(token, endpoint, { method: "PUT", body: fd });
-
-  if (!ok || json?.success === false) {
-    const msg =
-      json?.errors?.[0]?.message ||
-      json?.messages?.[0]?.message ||
-      `Upload failed (${status})`;
-    return { ok: false, error: msg, status, endpoint };
+    const r = await cf(token, `${base}/environments/production/script`, { method: "PUT", body: fd });
+    if (!r.ok) return { ok: false, error: r.json?.errors?.[0]?.message || `Upload script failed (${r.status})` };
   }
 
-  const workersUrl = subdomain ? `https://${scriptName}.${subdomain}.workers.dev/` : undefined;
-  return { ok: true, name: scriptName, url: workersUrl, status, endpoint };
+  // 3) Enable workers.dev
+  {
+    const r = await cf(
+      token,
+      `${base}/environments/production/settings`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workers_dev: true })
+      }
+    );
+    if (!r.ok) return { ok: false, error: r.json?.errors?.[0]?.message || `Enable workers_dev failed (${r.status})` };
+  }
+
+  const url = subdomain ? `https://${serviceName}.${subdomain}.workers.dev/` : undefined;
+
+  // 4) Quick health check (best-effort)
+  if (url) {
+    const ok = await waitForHealth(url);
+    if (!ok) return { ok: false, error: "Deployed but /api/health did not respond in time" };
+  }
+
+  return { ok: true, name: serviceName, url };
 }
 
-/** Short, URL-safe id for service/script names */
+async function waitForHealth(base: string) {
+  const target = new URL("/api/health", base).toString();
+  for (let i = 0; i < 8; i++) {
+    try {
+      const r = await fetch(target, { cf: { cacheTtl: 0 } as any });
+      if (r.ok) return true;
+    } catch {}
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return false;
+}
+
+/** Short, URL-safe id for service names */
 export function shortId(): string {
   const n = crypto.getRandomValues(new Uint32Array(1))[0];
   return n.toString(36).slice(0, 8);
