@@ -10,7 +10,6 @@ jobs:
     permissions:
       contents: read
     env:
-      # Avoid peer-deps install failures in CI
       NPM_CONFIG_LEGACY_PEER_DEPS: "true"
 
     steps:
@@ -20,22 +19,29 @@ jobs:
         with:
           node-version: '22'
 
-      # Install repo deps (root + app workspace)
       - name: Install deps
         run: npm install --no-audit --no-fund
 
-      # Build the SPA and copy to /public (via root scripts)
       - name: Build SPA → public/
         run: npm run build
 
       - name: Typecheck
         run: npm run typecheck
 
-      # Keep lint non-blocking for now
       - name: Lint (non-blocking)
         run: npm run lint
 
-      # Deploy using Wrangler (v4 pinned)
+      # ⬇️ Inject Cloudflare secrets into the Worker BEFORE deploy
+      - name: Set Worker Secrets (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID)
+        env:
+          CF_API_TOKEN:    ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID:   ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # Pipe values into wrangler; pass account-id explicitly
+          printf "%s" "$CF_API_TOKEN"  | npx wrangler@4.28.1 secret put CLOUDFLARE_API_TOKEN  --account-id "$CF_ACCOUNT_ID" --quiet
+          printf "%s" "$CF_ACCOUNT_ID" | npx wrangler@4.28.1 secret put CLOUDFLARE_ACCOUNT_ID --account-id "$CF_ACCOUNT_ID" --quiet
+
+      # 🚀 Deploy using wrangler-action (also authenticated with the same secrets)
       - name: Deploy (wrangler)
         uses: cloudflare/wrangler-action@v3
         with:
@@ -44,10 +50,9 @@ jobs:
           wranglerVersion: '4.28.1'
           command: deploy
 
-      # Basic post-deploy health check
       - name: Health check
         run: |
-          URL="https://launchwing-orchestrator.${{ secrets.CF_WORKERS_SUBDOMAIN }}.workers.dev/health"
+          URL="https://launchwing-orchestrator.${{ vars.CF_WORKERS_SUBDOMAIN || 'promptpulse' }}.workers.dev/health"
           echo "Hitting $URL"
           curl -fsS "$URL" | tee /tmp/health.json
           jq -e '.ok == true' /tmp/health.json
