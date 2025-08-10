@@ -87,7 +87,7 @@ function withActions(msg: any, actions: Array<{ label: string; command: string }
 export function useSendHandler(args: Args) {
   const { ideas, activeIdea, updateIdea, messageEndRef, setLoading } = args;
 
-  // Handles /build command (streams deploy logs)
+  // Handles /build command (streams deploy logs + shows real URL)
   async function handleBuildCommand(threadId: string) {
     let thread = (ideas.find((i) => i.id === threadId) ?? activeIdea).messages;
 
@@ -97,8 +97,13 @@ export function useSendHandler(args: Args) {
     scrollToEnd(messageEndRef);
 
     try {
-      await postJSON("/sandbox-deploy", { confirm: true }); // stubbed backend
+      // Kick off backend deploy
+      const resp = await postJSON<{ ok: boolean; url?: string; name?: string; error?: string }>(
+        "/sandbox-deploy",
+        { confirm: true }
+      );
 
+      // Simulate streaming logs while deploy runs
       const lines = [
         "Packaging artifacts...",
         "Generating repository files",
@@ -113,7 +118,6 @@ export function useSendHandler(args: Args) {
       let accum = "```log\n";
       for (const line of lines) {
         accum += line + "\n";
-        // stream each line
         const current = accum + "```";
         thread = (ideas.find((i) => i.id === threadId) ?? activeIdea).messages;
         const updated = [...thread];
@@ -124,11 +128,11 @@ export function useSendHandler(args: Args) {
       }
       accum += "```";
 
-      // Finish with a friendly summary + fake URL placeholder
+      const liveUrl = resp?.ok && resp.url ? resp.url : "(no url)";
       const summary =
         "\n\n**✅ Deployed.**\n" +
-        "- App URL: " + "https://example-app.workers.dev" + "\n" +
-        "- Repo: " + "(created via orchestrator)";
+        "- App URL: " + liveUrl + "\n" +
+        "- Repo: " + "(sandbox deploy)";
 
       thread = (ideas.find((i) => i.id === threadId) ?? activeIdea).messages;
       const updated = [...thread];
@@ -192,7 +196,7 @@ export function useSendHandler(args: Args) {
         }
       );
 
-      // 4) Add action buttons to the final assistant message
+      // 4) Add action buttons
       thread = (ideas.find((i) => i.id === id) ?? activeIdea).messages;
       const withBtns = [...thread];
       const last = withBtns[withBtns.length - 1];
