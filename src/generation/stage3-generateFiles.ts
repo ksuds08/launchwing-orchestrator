@@ -1,8 +1,7 @@
 import type { Env } from "../index";
-import type { IR } from "@types/ir";
-import type { FileManifest } from "@types/manifest";
+import type { IR } from "@t/ir";
+import type { FileManifest } from "@t/manifest";
 
-// For now, stub small, valid files. Replace with prompt-driven generation later.
 export async function generateFiles(_ir: IR, manifest: FileManifest, _env: Env): Promise<Record<string, string>> {
   const files: Record<string, string> = {};
   for (const p of manifest.files) {
