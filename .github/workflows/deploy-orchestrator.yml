@@ -9,6 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # keep npm from dying on peer-dep chatter during any npm install this job runs
+      NPM_CONFIG_LEGACY_PEER_DEPS: "true"
 
     steps:
       - uses: actions/checkout@v4
@@ -17,22 +20,24 @@ jobs:
         with:
           node-version: '22'
 
-      # Install deps without failing on peer-dep conflicts
+      # Install repo deps (no lockfile required)
       - name: Install deps
-        run: npm install --no-audit --no-fund --legacy-peer-deps
+        run: npm install --no-audit --no-fund
 
       - name: Typecheck
         run: npm run typecheck
 
-      # Keep lint non-blocking for now
+      # Lint is non-blocking for now
       - name: Lint (non-blocking)
-        run: npm run lint || true
+        run: npm run lint
 
+      # Deploy with wrangler-action; pin Wrangler v4 and let npm use legacy peers
       - name: Deploy (wrangler)
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4.28.1'
           command: deploy
 
       - name: Health check
