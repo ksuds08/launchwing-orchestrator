@@ -1,9 +1,8 @@
 import type { Env } from "../index";
-import type { IR } from "@types/ir";
-import type { FileManifest } from "@types/manifest";
+import type { IR } from "@t/ir";
+import type { FileManifest } from "@t/manifest";
 
-export async function irToManifest(ir: IR, _env: Env): Promise<FileManifest> {
-  // Minimal slot files; expand later per IR
+export async function irToManifest(_ir: IR, _env: Env): Promise<FileManifest> {
   return {
     files: [
       "app/src/pages/index.tsx",
