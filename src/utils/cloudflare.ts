@@ -1,4 +1,4 @@
-// Cloudflare Workers deploy helpers — Scripts API + workers.dev toggle (multipart 'settings') + health check
+// Cloudflare Workers deploy helpers — Scripts API upload + settings(workers_dev) + DEPLOYMENT + health check
 
 export interface DeployResult {
   ok: boolean;
@@ -39,8 +39,9 @@ function errMsg(r: CfResp, fallback: string) {
 
 /**
  * Upload a single-file **Module Worker** using the classic Scripts API,
- * then enable workers.dev via the /settings endpoint (multipart **settings** part).
- * Requires API token with "Workers Scripts: Edit" on the target account.
+ * enable workers.dev via /settings (multipart `settings` part),
+ * then **create a deployment** so the script becomes Active.
+ * Token needs: "Workers Scripts: Edit" on the account.
  */
 export async function uploadModuleWorker(
   scriptName: string,
@@ -67,12 +68,10 @@ export async function uploadModuleWorker(
     fd.append("index.js", new Blob([code], { type: "application/javascript+module" }), "index.js");
 
     const r = await cf(token, base, { method: "PUT", body: fd });
-    if (!r.ok) {
-      return { ok: false, error: errMsg(r, "Upload script failed"), status: r.status, endpoint: base };
-    }
+    if (!r.ok) return { ok: false, error: errMsg(r, "Upload script failed"), status: r.status, endpoint: base };
   }
 
-  // 2) Enable workers.dev for this script (multipart with a part named **settings**)
+  // 2) Enable workers.dev (multipart with a part named **settings**)
   {
     const settingsUrl = `${base}/settings`;
     const form = new FormData();
@@ -81,22 +80,28 @@ export async function uploadModuleWorker(
       new Blob([JSON.stringify({ workers_dev: true })], { type: "application/json" }),
       "settings.json"
     );
-
     const r = await cf(token, settingsUrl, { method: "PATCH", body: form });
-    if (!r.ok) {
-      return { ok: false, error: errMsg(r, "Enable workers_dev failed"), status: r.status, endpoint: settingsUrl };
-    }
+    if (!r.ok) return { ok: false, error: errMsg(r, "Enable workers_dev failed"), status: r.status, endpoint: settingsUrl };
+  }
+
+  // 3) ACTIVATE the script: create a deployment for latest version
+  {
+    const deployUrl = `${base}/deployments`;
+    // Empty body deploys the latest uploaded version to workers.dev (with settings above)
+    const r = await cf(token, deployUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (!r.ok) return { ok: false, error: errMsg(r, "Create deployment failed"), status: r.status, endpoint: deployUrl };
   }
 
   const url = subdomain ? `https://${scriptName}.${subdomain}.workers.dev/` : undefined;
 
-  // 3) Quick health check so we don’t return a dead URL
+  // 4) Quick health check so we don’t return a dead URL
   if (url) {
     const healthy = await waitForHealth(url);
-    if (!healthy) {
-      // Return a clear message; include URL so caller can try manually
-      return { ok: false, error: "Deployed, but /api/health did not respond in time", url, name: scriptName };
-    }
+    if (!healthy) return { ok: false, error: "Deployed, but /api/health did not respond in time", url, name: scriptName };
   }
 
   return { ok: true, name: scriptName, url };
@@ -104,7 +109,7 @@ export async function uploadModuleWorker(
 
 async function waitForHealth(base: string): Promise<boolean> {
   const target = new URL("/api/health", base).toString();
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 10; i++) {
     try {
       const r = await fetch(target as any, { cf: { cacheTtl: 0 } as any });
       if (r.ok) return true;
