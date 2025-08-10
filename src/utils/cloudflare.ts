@@ -1,4 +1,4 @@
-// Cloudflare Workers deploy helpers — Scripts API + workers.dev toggle (multipart) + health check
+// Cloudflare Workers deploy helpers — Scripts API + workers.dev toggle (multipart 'settings') + health check
 
 export interface DeployResult {
   ok: boolean;
@@ -30,12 +30,16 @@ async function cf(token: string, url: string, init: RequestInit): Promise<CfResp
 }
 
 function errMsg(r: CfResp, fallback: string) {
-  return r.json?.errors?.[0]?.message || r.json?.messages?.[0]?.message || `${fallback} (${r.status}) :: ${r.raw.slice(0,200)}`;
+  return (
+    r.json?.errors?.[0]?.message ||
+    r.json?.messages?.[0]?.message ||
+    `${fallback} (${r.status}) :: ${r.raw.slice(0, 200)}`
+  );
 }
 
 /**
  * Upload a single-file **Module Worker** using the classic Scripts API,
- * then enable workers.dev via the /settings endpoint (multipart metadata).
+ * then enable workers.dev via the /settings endpoint (multipart **settings** part).
  * Requires API token with "Workers Scripts: Edit" on the target account.
  */
 export async function uploadModuleWorker(
@@ -51,7 +55,9 @@ export async function uploadModuleWorker(
     return { ok: false, error: "Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID" };
   }
 
-  const base = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}`;
+  const base = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(
+    scriptName
+  )}`;
 
   // 1) Upload module (multipart: metadata + index.js)
   {
@@ -61,17 +67,25 @@ export async function uploadModuleWorker(
     fd.append("index.js", new Blob([code], { type: "application/javascript+module" }), "index.js");
 
     const r = await cf(token, base, { method: "PUT", body: fd });
-    if (!r.ok) return { ok: false, error: errMsg(r, "Upload script failed"), status: r.status, endpoint: base };
+    if (!r.ok) {
+      return { ok: false, error: errMsg(r, "Upload script failed"), status: r.status, endpoint: base };
+    }
   }
 
-  // 2) Enable workers.dev for this script (⚠️ must be multipart with "metadata")
+  // 2) Enable workers.dev for this script (multipart with a part named **settings**)
   {
     const settingsUrl = `${base}/settings`;
-    const metadataOnly = new FormData();
-    metadataOnly.append("metadata", new Blob([JSON.stringify({ workers_dev: true })], { type: "application/json" }), "metadata.json");
+    const form = new FormData();
+    form.append(
+      "settings",
+      new Blob([JSON.stringify({ workers_dev: true })], { type: "application/json" }),
+      "settings.json"
+    );
 
-    const r = await cf(token, settingsUrl, { method: "PATCH", body: metadataOnly });
-    if (!r.ok) return { ok: false, error: errMsg(r, "Enable workers_dev failed"), status: r.status, endpoint: settingsUrl };
+    const r = await cf(token, settingsUrl, { method: "PATCH", body: form });
+    if (!r.ok) {
+      return { ok: false, error: errMsg(r, "Enable workers_dev failed"), status: r.status, endpoint: settingsUrl };
+    }
   }
 
   const url = subdomain ? `https://${scriptName}.${subdomain}.workers.dev/` : undefined;
@@ -79,7 +93,10 @@ export async function uploadModuleWorker(
   // 3) Quick health check so we don’t return a dead URL
   if (url) {
     const healthy = await waitForHealth(url);
-    if (!healthy) return { ok: false, error: "Deployed, but /api/health did not respond in time", url, name: scriptName };
+    if (!healthy) {
+      // Return a clear message; include URL so caller can try manually
+      return { ok: false, error: "Deployed, but /api/health did not respond in time", url, name: scriptName };
+    }
   }
 
   return { ok: true, name: scriptName, url };
@@ -91,7 +108,7 @@ async function waitForHealth(base: string): Promise<boolean> {
     try {
       const r = await fetch(target as any, { cf: { cacheTtl: 0 } as any });
       if (r.ok) return true;
-    } catch {}
+    } catch { /* ignore and retry */ }
     await new Promise(res => setTimeout(res, 500));
   }
   return false;
