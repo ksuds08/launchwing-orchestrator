@@ -10,7 +10,7 @@ jobs:
     permissions:
       contents: read
     env:
-      # keep npm from dying on peer-dep chatter during any npm install this job runs
+      # Avoid peer-deps install failures in CI
       NPM_CONFIG_LEGACY_PEER_DEPS: "true"
 
     steps:
@@ -20,18 +20,22 @@ jobs:
         with:
           node-version: '22'
 
-      # Install repo deps (no lockfile required)
+      # Install repo deps (root + app workspace)
       - name: Install deps
         run: npm install --no-audit --no-fund
+
+      # Build the SPA and copy to /public (via root scripts)
+      - name: Build SPA → public/
+        run: npm run build
 
       - name: Typecheck
         run: npm run typecheck
 
-      # Lint is non-blocking for now
+      # Keep lint non-blocking for now
       - name: Lint (non-blocking)
         run: npm run lint
 
-      # Deploy with wrangler-action; pin Wrangler v4 and let npm use legacy peers
+      # Deploy using Wrangler (v4 pinned)
       - name: Deploy (wrangler)
         uses: cloudflare/wrangler-action@v3
         with:
@@ -40,6 +44,7 @@ jobs:
           wranglerVersion: '4.28.1'
           command: deploy
 
+      # Basic post-deploy health check
       - name: Health check
         run: |
           URL="https://launchwing-orchestrator.${{ secrets.CF_WORKERS_SUBDOMAIN }}.workers.dev/health"
