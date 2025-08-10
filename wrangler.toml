@@ -5,3 +5,7 @@ compatibility_date = "2025-08-10"
 [assets]
 directory = "public"
 binding = "ASSETS"
+
+[vars]
+# Non-secret; safe to commit
+CF_WORKERS_SUBDOMAIN = "promptpulse"
