@@ -1,4 +1,4 @@
-// Cloudflare Workers deploy helpers — Scripts API upload + settings(workers_dev) + DEPLOYMENT(version_id) + health check
+// Cloudflare Workers deploy helpers — Scripts API upload + settings(workers_dev) + DEPLOYMENT(version_id) + health check (with version poll)
 
 export interface DeployResult {
   ok: boolean;
@@ -78,18 +78,10 @@ export async function uploadModuleWorker(
     if (!r.ok) return { ok: false, error: errMsg(r, "Enable workers_dev failed"), status: r.status, endpoint: settingsUrl };
   }
 
-  // 3) Get latest version id
-  let versionId: string | undefined;
-  {
-    const versionsUrl = `${base}/versions?per_page=1`;
-    const r = await cf(token, versionsUrl, { method: "GET" });
-    if (!r.ok) return { ok: false, error: errMsg(r, "Fetch versions failed"), status: r.status, endpoint: versionsUrl };
-
-    // The API returns newest-first; pick first item
-    versionId = r.json?.result?.[0]?.id || r.json?.result?.versions?.[0]?.id;
-    if (!versionId) {
-      return { ok: false, error: "Could not resolve latest version_id after upload" };
-    }
+  // 3) Poll for latest version id (eventual consistency)
+  const versionId = await waitForVersionId(token, base);
+  if (!versionId) {
+    return { ok: false, error: "Upload succeeded but could not resolve latest version_id after polling" };
   }
 
   // 4) Create deployment pointing at that version
@@ -115,6 +107,25 @@ export async function uploadModuleWorker(
   }
 
   return { ok: true, name: scriptName, url };
+}
+
+async function waitForVersionId(token: string, baseScriptUrl: string): Promise<string | undefined> {
+  const versionsUrl = `${baseScriptUrl}/versions?per_page=1`;
+  for (let i = 0; i < 12; i++) { // ~6s total
+    const r = await cf(token, versionsUrl, { method: "GET" });
+    if (r.ok) {
+      // API may return either { result: [ {id,...} ] } or { result: { versions: [ {id,...} ] } }
+      const arr = Array.isArray(r.json?.result)
+        ? r.json.result
+        : Array.isArray(r.json?.result?.versions)
+          ? r.json.result.versions
+          : [];
+      const id = arr?.[0]?.id;
+      if (id) return id;
+    }
+    await new Promise(res => setTimeout(res, 500));
+  }
+  return undefined;
 }
 
 async function waitForHealth(base: string): Promise<boolean> {
