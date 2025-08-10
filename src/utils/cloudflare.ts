@@ -1,4 +1,4 @@
-// Cloudflare Workers deploy helpers — Scripts API upload + settings(workers_dev) + DEPLOYMENT(version) + health check
+// Cloudflare Workers deploy helpers — Scripts API upload + settings(workers_dev) + DEPLOYMENT(version_id) + health check
 
 export interface DeployResult {
   ok: boolean;
@@ -37,12 +37,6 @@ function errMsg(r: CfResp, fallback: string) {
   );
 }
 
-/**
- * Upload a single-file **Module Worker** using the classic Scripts API,
- * enable workers.dev via /settings (multipart `settings` part),
- * then **create a deployment** that targets the just-uploaded version.
- * Token needs: "Workers Scripts: Edit" on the account.
- */
 export async function uploadModuleWorker(
   scriptName: string,
   code: string,
@@ -61,7 +55,6 @@ export async function uploadModuleWorker(
   )}`;
 
   // 1) Upload module (multipart: metadata + index.js)
-  let versionId: string | undefined;
   {
     const metadata = { main_module: "index.js", compatibility_date: "2024-11-01" };
     const fd = new FormData();
@@ -69,13 +62,7 @@ export async function uploadModuleWorker(
     fd.append("index.js", new Blob([code], { type: "application/javascript+module" }), "index.js");
 
     const r = await cf(token, base, { method: "PUT", body: fd });
-    if (!r.ok) {
-      return { ok: false, error: errMsg(r, "Upload script failed"), status: r.status, endpoint: base };
-    }
-    versionId = r.json?.result?.id || r.json?.id;
-    if (!versionId) {
-      return { ok: false, error: "Upload succeeded but no version id returned" };
-    }
+    if (!r.ok) return { ok: false, error: errMsg(r, "Upload script failed"), status: r.status, endpoint: base };
   }
 
   // 2) Enable workers.dev (multipart with a part named **settings**)
@@ -88,28 +75,38 @@ export async function uploadModuleWorker(
       "settings.json"
     );
     const r = await cf(token, settingsUrl, { method: "PATCH", body: form });
-    if (!r.ok) {
-      return { ok: false, error: errMsg(r, "Enable workers_dev failed"), status: r.status, endpoint: settingsUrl };
+    if (!r.ok) return { ok: false, error: errMsg(r, "Enable workers_dev failed"), status: r.status, endpoint: settingsUrl };
+  }
+
+  // 3) Get latest version id
+  let versionId: string | undefined;
+  {
+    const versionsUrl = `${base}/versions?per_page=1`;
+    const r = await cf(token, versionsUrl, { method: "GET" });
+    if (!r.ok) return { ok: false, error: errMsg(r, "Fetch versions failed"), status: r.status, endpoint: versionsUrl };
+
+    // The API returns newest-first; pick first item
+    versionId = r.json?.result?.[0]?.id || r.json?.result?.versions?.[0]?.id;
+    if (!versionId) {
+      return { ok: false, error: "Could not resolve latest version_id after upload" };
     }
   }
 
-  // 3) ACTIVATE the upload: create a deployment pointing at the new version
+  // 4) Create deployment pointing at that version
   {
     const deployUrl = `${base}/deployments`;
-    const body = { versions: [{ id: versionId, percentage: 100 }] };
+    const body = { version_id: versionId };
     const r = await cf(token, deployUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!r.ok) {
-      return { ok: false, error: errMsg(r, "Create deployment failed"), status: r.status, endpoint: deployUrl };
-    }
+    if (!r.ok) return { ok: false, error: errMsg(r, "Create deployment failed"), status: r.status, endpoint: deployUrl };
   }
 
   const url = subdomain ? `https://${scriptName}.${subdomain}.workers.dev/` : undefined;
 
-  // 4) Quick health check so we don’t return a dead URL
+  // 5) Quick health check so we don’t return a dead URL
   if (url) {
     const healthy = await waitForHealth(url);
     if (!healthy) {
