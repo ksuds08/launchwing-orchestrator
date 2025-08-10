@@ -1,1 +1,3 @@
-manifest.ts
+export interface FileManifest {
+  files: string[];
+}
