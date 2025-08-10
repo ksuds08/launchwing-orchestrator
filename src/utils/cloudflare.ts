@@ -1,4 +1,4 @@
-// Cloudflare Workers deploy helpers — Services API with workers_dev + health check
+// Cloudflare Workers deploy helpers — Scripts API + workers.dev toggle (multipart) + health check
 
 export interface DeployResult {
   ok: boolean;
@@ -6,6 +6,8 @@ export interface DeployResult {
   url?: string;
   deploymentId?: string;
   error?: string;
+  status?: number;
+  endpoint?: string;
 }
 
 interface EnvLike {
@@ -14,19 +16,30 @@ interface EnvLike {
   CF_WORKERS_SUBDOMAIN?: string;
 }
 
-type CfResp = { ok: boolean; status: number; json: any };
+type CfResp = { ok: boolean; status: number; json: any; raw: string };
 
 async function cf(token: string, url: string, init: RequestInit): Promise<CfResp> {
   const res = await fetch(url, {
     ...init,
     headers: { Authorization: `Bearer ${token}`, ...(init.headers || {}) },
   });
-  const json = await res.json().catch(() => ({}));
-  return { ok: res.ok, status: res.status, json };
+  const raw = await res.text();
+  let json: any = {};
+  try { json = JSON.parse(raw); } catch {}
+  return { ok: res.ok, status: res.status, json, raw };
 }
 
+function errMsg(r: CfResp, fallback: string) {
+  return r.json?.errors?.[0]?.message || r.json?.messages?.[0]?.message || `${fallback} (${r.status}) :: ${r.raw.slice(0,200)}`;
+}
+
+/**
+ * Upload a single-file **Module Worker** using the classic Scripts API,
+ * then enable workers.dev via the /settings endpoint (multipart metadata).
+ * Requires API token with "Workers Scripts: Edit" on the target account.
+ */
 export async function uploadModuleWorker(
-  serviceName: string,
+  scriptName: string,
   code: string,
   env: EnvLike
 ): Promise<DeployResult> {
@@ -38,58 +51,38 @@ export async function uploadModuleWorker(
     return { ok: false, error: "Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID" };
   }
 
-  const base = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/services/${encodeURIComponent(
-    serviceName
-  )}`;
+  const base = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}`;
 
-  // 1) Ensure service exists (idempotent)
-  {
-    const r = await cf(token, base, { method: "PUT" });
-    if (!r.ok && r.status !== 409) {
-      const msg = r.json?.errors?.[0]?.message ?? `Create service failed (${r.status})`;
-      return { ok: false, error: msg };
-    }
-  }
-
-  // 2) Upload module to production
+  // 1) Upload module (multipart: metadata + index.js)
   {
     const metadata = { main_module: "index.js", compatibility_date: "2024-11-01" };
     const fd = new FormData();
     fd.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
     fd.append("index.js", new Blob([code], { type: "application/javascript+module" }), "index.js");
 
-    const r = await cf(token, `${base}/environments/production/script`, { method: "PUT", body: fd });
-    if (!r.ok) {
-      const msg = r.json?.errors?.[0]?.message ?? `Upload script failed (${r.status})`;
-      return { ok: false, error: msg };
-    }
+    const r = await cf(token, base, { method: "PUT", body: fd });
+    if (!r.ok) return { ok: false, error: errMsg(r, "Upload script failed"), status: r.status, endpoint: base };
   }
 
-  // 3) Enable workers.dev
+  // 2) Enable workers.dev for this script (⚠️ must be multipart with "metadata")
   {
-    const r = await cf(token, `${base}/environments/production/settings`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workers_dev: true }),
-    });
-    if (!r.ok) {
-      const msg = r.json?.errors?.[0]?.message ?? `Enable workers_dev failed (${r.status})`;
-      return { ok: false, error: msg };
-    }
+    const settingsUrl = `${base}/settings`;
+    const metadataOnly = new FormData();
+    metadataOnly.append("metadata", new Blob([JSON.stringify({ workers_dev: true })], { type: "application/json" }), "metadata.json");
+
+    const r = await cf(token, settingsUrl, { method: "PATCH", body: metadataOnly });
+    if (!r.ok) return { ok: false, error: errMsg(r, "Enable workers_dev failed"), status: r.status, endpoint: settingsUrl };
   }
 
-  const url = subdomain ? `https://${serviceName}.${subdomain}.workers.dev/` : undefined;
+  const url = subdomain ? `https://${scriptName}.${subdomain}.workers.dev/` : undefined;
 
-  // 4) Quick health check (best‑effort; don’t block success forever)
+  // 3) Quick health check so we don’t return a dead URL
   if (url) {
-    const ok = await waitForHealth(url);
-    if (!ok) {
-      // Return ok=false so UI can surface a helpful message
-      return { ok: false, error: "Deployed, but /api/health did not respond in time" };
-    }
+    const healthy = await waitForHealth(url);
+    if (!healthy) return { ok: false, error: "Deployed, but /api/health did not respond in time", url, name: scriptName };
   }
 
-  return { ok: true, name: serviceName, url };
+  return { ok: true, name: scriptName, url };
 }
 
 async function waitForHealth(base: string): Promise<boolean> {
@@ -98,15 +91,13 @@ async function waitForHealth(base: string): Promise<boolean> {
     try {
       const r = await fetch(target as any, { cf: { cacheTtl: 0 } as any });
       if (r.ok) return true;
-    } catch {
-      // ignore and retry
-    }
-    await new Promise((res) => setTimeout(res, 500));
+    } catch {}
+    await new Promise(res => setTimeout(res, 500));
   }
   return false;
 }
 
-/** Short, URL-safe id for service names */
+/** Short, URL-safe id for script names */
 export function shortId(): string {
   const n = crypto.getRandomValues(new Uint32Array(1))[0];
   return n.toString(36).slice(0, 8);
