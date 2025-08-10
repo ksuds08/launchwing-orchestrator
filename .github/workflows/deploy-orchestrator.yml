@@ -7,7 +7,6 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
 
@@ -18,13 +17,13 @@ jobs:
         with:
           node-version: '22'
 
+      # Use npm install because the repo has no package-lock.json yet
       - name: Install deps
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Typecheck
         run: npm run typecheck
 
-      # Optional: lint (won't fail the deploy if you prefer)
       - name: Lint (non-blocking)
         run: npm run lint || true
 
@@ -35,7 +34,6 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: deploy
 
-      # Basic post-deploy health check (assumes wrangler.toml name = "launchwing-orchestrator")
       - name: Health check
         run: |
           URL="https://launchwing-orchestrator.${{ secrets.CF_WORKERS_SUBDOMAIN }}.workers.dev/health"
