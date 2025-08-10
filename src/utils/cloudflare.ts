@@ -1,10 +1,9 @@
-// Cloudflare Workers deploy helpers — Scripts API upload + settings(workers_dev) + DEPLOYMENT(version_id) + health check (with version poll)
+// Cloudflare Workers deploy helpers — Scripts API upload + workers.dev (settings multipart) + robust readiness poll
 
 export interface DeployResult {
   ok: boolean;
   name?: string;
   url?: string;
-  deploymentId?: string;
   error?: string;
   status?: number;
   endpoint?: string;
@@ -78,64 +77,44 @@ export async function uploadModuleWorker(
     if (!r.ok) return { ok: false, error: errMsg(r, "Enable workers_dev failed"), status: r.status, endpoint: settingsUrl };
   }
 
-  // 3) Poll for latest version id (eventual consistency)
-  const versionId = await waitForVersionId(token, base);
-  if (!versionId) {
-    return { ok: false, error: "Upload succeeded but could not resolve latest version_id after polling" };
-  }
-
-  // 4) Create deployment pointing at that version
-  {
-    const deployUrl = `${base}/deployments`;
-    const body = { version_id: versionId };
-    const r = await cf(token, deployUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) return { ok: false, error: errMsg(r, "Create deployment failed"), status: r.status, endpoint: deployUrl };
-  }
-
+  // 3) Compute workers.dev URL
   const url = subdomain ? `https://${scriptName}.${subdomain}.workers.dev/` : undefined;
+  if (!url) return { ok: true, name: scriptName, url: undefined };
 
-  // 5) Quick health check so we don’t return a dead URL
-  if (url) {
-    const healthy = await waitForHealth(url);
-    if (!healthy) {
-      return { ok: false, error: "Deployed, but /api/health did not respond in time", url, name: scriptName };
-    }
+  // 4) Readiness poll: prefer /api/health; fall back to root placeholder detection
+  const healthy = await waitForReadiness(url);
+  if (!healthy) {
+    // Return URL so you can check manually; usually propagates a bit later
+    return { ok: false, error: "Deployed, route enabled, but not serving yet (likely propagation). Try again shortly.", url, status: 200 };
   }
 
   return { ok: true, name: scriptName, url };
 }
 
-async function waitForVersionId(token: string, baseScriptUrl: string): Promise<string | undefined> {
-  const versionsUrl = `${baseScriptUrl}/versions?per_page=1`;
-  for (let i = 0; i < 12; i++) { // ~6s total
-    const r = await cf(token, versionsUrl, { method: "GET" });
-    if (r.ok) {
-      // API may return either { result: [ {id,...} ] } or { result: { versions: [ {id,...} ] } }
-      const arr = Array.isArray(r.json?.result)
-        ? r.json.result
-        : Array.isArray(r.json?.result?.versions)
-          ? r.json.result.versions
-          : [];
-      const id = arr?.[0]?.id;
-      if (id) return id;
-    }
-    await new Promise(res => setTimeout(res, 500));
-  }
-  return undefined;
-}
+async function waitForReadiness(base: string): Promise<boolean> {
+  const healthUrl = new URL("/api/health", base).toString();
+  const rootUrl = base;
 
-async function waitForHealth(base: string): Promise<boolean> {
-  const target = new URL("/api/health", base).toString();
-  for (let i = 0; i < 10; i++) {
+  const isPlaceholder = (html: string) =>
+    /There is nothing here yet/i.test(html) || /workers\.dev/i.test(html) && /nothing here/i.test(html);
+
+  const attempts = 30;     // ~90s total
+  for (let i = 0; i < attempts; i++) {
     try {
-      const r = await fetch(target as any, { cf: { cacheTtl: 0 } as any });
-      if (r.ok) return true;
-    } catch { /* ignore and retry */ }
-    await new Promise(res => setTimeout(res, 500));
+      // 1) Try health
+      const h = await fetch(healthUrl as any, { cf: { cacheTtl: 0 } as any });
+      if (h.ok) return true;
+
+      // 2) Try root and ensure it's not the CF placeholder
+      const r = await fetch(rootUrl as any, { cf: { cacheTtl: 0 } as any });
+      if (r.ok) {
+        const text = await r.text();
+        if (!isPlaceholder(text)) return true;
+      }
+    } catch {
+      // ignore network hiccups and retry
+    }
+    await new Promise(res => setTimeout(res, 3000)); // 3s backoff
   }
   return false;
 }
