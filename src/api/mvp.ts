@@ -3,7 +3,7 @@ import { runGenerationStages } from "@gen/runGenerationStages";
 import { json, withReqId } from "@utils/log";
 
 export const mvpHandler = withReqId(async (req: Request, env: Env) => {
-  const body = await req.json().catch(() => ({}));
+  const body = (await req.json().catch(() => ({}))) as any;
   const idea: string = body?.idea ?? "";
   if (!idea) return json({ ok: false, error: "Missing 'idea' in body" }, 400);
 
