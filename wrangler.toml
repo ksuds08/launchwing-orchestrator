@@ -1,1 +1,9 @@
+name = "launchwing-orchestrator"
+main = "src/index.ts"
+compatibility_date = "2025-08-10"
 
+# Add bindings as you need them later (KV, D1, R2, etc.)
+# [vars]
+# OPENAI_API_KEY = "set-in-dashboard-or-secrets"
+# GITHUB_TOKEN = "..."
+# CLOUDFLARE_ACCOUNT_ID = "..."
