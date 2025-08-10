@@ -2,7 +2,10 @@
   "name": "launchwing-orchestrator",
   "private": true,
   "type": "module",
+  "workspaces": ["app"],
   "scripts": {
+    "build": "npm run build -w app && npm run postbuild",
+    "postbuild": "rm -rf public && mkdir -p public && cp -r app/dist/* public/",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
