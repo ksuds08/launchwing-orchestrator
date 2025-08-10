@@ -1,4 +1,4 @@
-// Cloudflare Workers deploy helpers — classic Scripts API (stable)
+// Cloudflare Workers deploy helpers — classic Scripts API (stable + workers_dev enable)
 
 export interface DeployResult {
   ok: boolean;
@@ -16,9 +16,26 @@ interface EnvLike {
   CF_WORKERS_SUBDOMAIN?: string;
 }
 
+async function cf<T = any>(
+  token: string,
+  url: string,
+  init: RequestInit
+): Promise<{ ok: boolean; status: number; json: any }> {
+  const res = await fetch(url, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(init.headers || {}),
+    },
+  });
+  const json = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, json };
+}
+
 /**
- * Upload a single-file **Module Worker** using the classic Scripts API.
- * Requires API token with "Workers Scripts: Edit" on the target account.
+ * Upload a single-file **Module Worker** using the classic Scripts API,
+ * then explicitly enable workers.dev for that script.
+ * Requires API token with "Workers Scripts: Edit".
  */
 export async function uploadModuleWorker(
   scriptName: string,
@@ -33,48 +50,51 @@ export async function uploadModuleWorker(
     return { ok: false, error: "Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID" };
   }
 
-  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(
+  const base = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(
     scriptName
   )}`;
 
-  // Multipart payload: metadata + main module
+  // 1) Upload module (multipart: metadata + index.js)
   const metadata = {
     main_module: "index.js",
-    compatibility_date: "2024-11-01"
+    compatibility_date: "2024-11-01",
   };
 
   const fd = new FormData();
   fd.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
   fd.append("index.js", new Blob([code], { type: "application/javascript+module" }), "index.js");
 
-  const res = await fetch(endpoint, {
-    method: "PUT",
-    headers: {
-      Authorization: `Bearer ${token}`
-    },
-    body: fd
-  });
+  {
+    const { ok, status, json } = await cf(token, base, { method: "PUT", body: fd });
+    if (!ok || json?.success === false) {
+      const msg =
+        json?.errors?.[0]?.message ||
+        json?.messages?.[0]?.message ||
+        `Upload failed (${status})`;
+      return { ok: false, error: msg, status, endpoint: base };
+    }
+  }
 
-  const json: any = await res.json().catch(() => ({}));
-
-  if (!res.ok || json?.success === false) {
-    const msg =
-      json?.errors?.[0]?.message ||
-      json?.messages?.[0]?.message ||
-      `CF API ${res.status}`;
-    return { ok: false, error: msg, status: res.status, endpoint };
+  // 2) Enable workers.dev for this script (required for <name>.<subdomain>.workers.dev)
+  {
+    const settingsUrl = `${base}/settings`;
+    const body = { workers_dev: true };
+    const { ok, status, json } = await cf(token, settingsUrl, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!ok || json?.success === false) {
+      const msg =
+        json?.errors?.[0]?.message ||
+        json?.messages?.[0]?.message ||
+        `Enable workers_dev failed (${status})`;
+      return { ok: false, error: msg, status, endpoint: settingsUrl };
+    }
   }
 
   const workersUrl = subdomain ? `https://${scriptName}.${subdomain}.workers.dev/` : undefined;
-
-  return {
-    ok: true,
-    name: scriptName,
-    url: workersUrl,
-    deploymentId: json?.result?.id,
-    status: res.status,
-    endpoint
-  };
+  return { ok: true, name: scriptName, url: workersUrl };
 }
 
 /** Short, URL-safe id for script names */
