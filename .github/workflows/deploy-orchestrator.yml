@@ -10,6 +10,7 @@ jobs:
     permissions:
       contents: read
     env:
+      # Keep npm from failing on peer-dep noise
       NPM_CONFIG_LEGACY_PEER_DEPS: "true"
 
     steps:
@@ -19,29 +20,39 @@ jobs:
         with:
           node-version: '22'
 
+      # Install root + workspace deps
       - name: Install deps
         run: npm install --no-audit --no-fund
 
+      # Build the SPA and copy to /public (via root scripts)
       - name: Build SPA → public/
         run: npm run build
 
       - name: Typecheck
         run: npm run typecheck
 
+      # Lint is non-blocking for now
       - name: Lint (non-blocking)
         run: npm run lint
 
-      # ⬇️ Inject Cloudflare secrets into the Worker BEFORE deploy
+      # --- Inject Cloudflare secrets into the Worker BEFORE deploy ---
       - name: Set Worker Secrets (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID)
         env:
-          CF_API_TOKEN:    ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ACCOUNT_ID:   ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          # Pipe values into wrangler; pass account-id explicitly
-          printf "%s" "$CF_API_TOKEN"  | npx wrangler@4.28.1 secret put CLOUDFLARE_API_TOKEN  --account-id "$CF_ACCOUNT_ID" --quiet
-          printf "%s" "$CF_ACCOUNT_ID" | npx wrangler@4.28.1 secret put CLOUDFLARE_ACCOUNT_ID --account-id "$CF_ACCOUNT_ID" --quiet
+          # Ensure wrangler is available (pinned)
+          npx --yes wrangler@4.28.1 --version
 
-      # 🚀 Deploy using wrangler-action (also authenticated with the same secrets)
+          # Delete existing secrets to avoid interactive overwrite prompts
+          yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator || true
+          yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator || true
+
+          # Create/update secrets (values via stdin)
+          printf "%s" "$CLOUDFLARE_API_TOKEN"  | npx wrangler@4.28.1 secret put CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator
+          printf "%s" "$CLOUDFLARE_ACCOUNT_ID" | npx wrangler@4.28.1 secret put CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator
+
+      # --- Deploy using wrangler-action (pinned v4) ---
       - name: Deploy (wrangler)
         uses: cloudflare/wrangler-action@v3
         with:
@@ -50,9 +61,11 @@ jobs:
           wranglerVersion: '4.28.1'
           command: deploy
 
+      # Basic post-deploy health check
       - name: Health check
         run: |
-          URL="https://launchwing-orchestrator.${{ vars.CF_WORKERS_SUBDOMAIN || 'promptpulse' }}.workers.dev/health"
+          SUBDOMAIN="${{ vars.CF_WORKERS_SUBDOMAIN || 'promptpulse' }}"
+          URL="https://launchwing-orchestrator.${SUBDOMAIN}.workers.dev/health"
           echo "Hitting $URL"
           curl -fsS "$URL" | tee /tmp/health.json
           jq -e '.ok == true' /tmp/health.json
