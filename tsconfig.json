@@ -5,14 +5,18 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
-    "types": ["@cloudflare/workers-types"],
+
+    "lib": ["ES2022"],                      // avoid lib.dom collisions
+    "types": ["@cloudflare/workers-types"], // Workers runtime types
+    "skipLibCheck": true,                   // ignore lib type conflicts
+
     "baseUrl": ".",
     "paths": {
       "@api/*": ["src/api/*"],
       "@gen/*": ["src/generation/*"],
       "@utils/*": ["src/utils/*"],
-      "@types/*": ["src/types/*"]
+      "@t/*": ["src/types/*"]
     }
   },
-  "include": ["src"]
+  "include": ["src/**/*.ts"]
 }
