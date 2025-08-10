@@ -1,11 +1,12 @@
 import type { Env } from "../index";
-import type { IR } from "@types/ir";
+import type { IR } from "@t/ir";
 
-// TODO: call model with idea-to-IR prompt and validate by JSON Schema
+// TODO: Add prompt + JSON Schema validation
 export async function ideaToIR(idea: string, _env: Env): Promise<IR> {
+  const name = (idea || "Generated App").slice(0, 40);
   return {
     app_type: "spa_api",
-    name: "Generated App",
+    name,
     features: ["forms"],
     api_routes: [
       { path: "/api/health", method: "GET" },
