@@ -1,1 +1,44 @@
+name: Deploy Orchestrator to Cloudflare Workers
 
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Optional: lint (won't fail the deploy if you prefer)
+      - name: Lint (non-blocking)
+        run: npm run lint || true
+
+      - name: Deploy (wrangler)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
+
+      # Basic post-deploy health check (assumes wrangler.toml name = "launchwing-orchestrator")
+      - name: Health check
+        run: |
+          URL="https://launchwing-orchestrator.${{ secrets.CF_WORKERS_SUBDOMAIN }}.workers.dev/health"
+          echo "Hitting $URL"
+          curl -fsS "$URL" | tee /tmp/health.json
+          jq -e '.ok == true' /tmp/health.json
