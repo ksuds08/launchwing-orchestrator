@@ -125,7 +125,7 @@ async function deployPagesDirect(env: Env, name: string): Promise<{ url: string 
   </body>
 </html>`;
 
-  // NOTE: this worker includes an INLINE index fallback to avoid 404s immediately after deploy
+  // Worker with INLINE index fallback so fresh deployments don't 404
   const workerJs = `// Pages Advanced Mode proxy to orchestrator with inline index fallback
 const ORCH = ${JSON.stringify(ORCH)};
 const INLINE_INDEX = ${JSON.stringify(indexHtml)};
@@ -298,15 +298,8 @@ export default {
 
   if (!dep.ok) throw new Error(`Pages deploy failed: HTTP ${dep.status} — ${depText}`);
 
-  let depJson: any = {};
-  try { depJson = depText ? JSON.parse(depText) : {}; } catch { /* noop */ }
-
-  const result = depJson?.result || depJson;
-  const primary = result?.url || result?.domains?.[0];
-  const url = primary
-    ? (/^https?:\/\//i.test(primary) ? primary : `https://${primary}`)
-    : `https://${name}.pages.dev`;
-
+  // Always return the project (production) domain to avoid TLS/cert on hash subdomain
+  const url = `https://${name}.pages.dev`;
   return { url };
 }
 
