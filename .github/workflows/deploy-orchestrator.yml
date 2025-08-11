@@ -32,52 +32,35 @@ jobs:
       - name: Lint (non-blocking)
         run: npm run lint || true
 
-      # ---------- Inject all Worker secrets (token, account, email/key, orchestrator) ----------
+      # ---------- Inject Worker secrets (token, account, optional email/key, orchestrator URL) ----------
       - name: Set Worker Secrets
         env:
-          # Wrangler itself needs these present for ANY command
           CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Optional legacy auth (not required if token has correct scopes)
           CF_EMAIL:              ${{ secrets.CLOUDFLARE_EMAIL }}
           CF_KEY:                ${{ secrets.CLOUDFLARE_API_KEY }}
-          # New: orchestrator URL exposed to the Worker at runtime
           ORCHESTRATOR_URL:      ${{ secrets.ORCHESTRATOR_URL }}
         run: |
           npx --yes wrangler@4.28.1 --version
 
-          # Token (required for wrangler to run)
-          if [ -n "${CLOUDFLARE_API_TOKEN}" ]; then
-            yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator || true
-            printf "%s" "$CLOUDFLARE_API_TOKEN"  | npx wrangler@4.28.1 secret put CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator
-          else
-            echo "❌ CLOUDFLARE_API_TOKEN GitHub secret is missing"; exit 1
-          fi
+          # Token
+          yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator || true
+          printf "%s" "$CLOUDFLARE_API_TOKEN"  | npx wrangler@4.28.1 secret put CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator
 
-          # Account ID (used by runtime API calls)
-          if [ -n "${CLOUDFLARE_ACCOUNT_ID}" ]; then
-            yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator || true
-            printf "%s" "$CLOUDFLARE_ACCOUNT_ID" | npx wrangler@4.28.1 secret put CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator
-          else
-            echo "❌ CLOUDFLARE_ACCOUNT_ID GitHub secret is missing"; exit 1
-          fi
+          # Account ID
+          yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator || true
+          printf "%s" "$CLOUDFLARE_ACCOUNT_ID" | npx wrangler@4.28.1 secret put CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator
 
-          # Orchestrator public URL for Pages proxies / generated apps
-          if [ -n "${ORCHESTRATOR_URL}" ]; then
-            yes | npx wrangler@4.28.1 secret delete ORCHESTRATOR_URL --name launchwing-orchestrator || true
-            printf "%s" "$ORCHESTRATOR_URL" | npx wrangler@4.28.1 secret put ORCHESTRATOR_URL --name launchwing-orchestrator
-          else
-            echo "⚠️ ORCHESTRATOR_URL not provided; /api routes proxied from Pages may not resolve correctly."
-          fi
+          # Orchestrator URL (used by generated Pages worker proxy)
+          yes | npx wrangler@4.28.1 secret delete ORCHESTRATOR_URL --name launchwing-orchestrator || true
+          printf "%s" "$ORCHESTRATOR_URL" | npx wrangler@4.28.1 secret put ORCHESTRATOR_URL --name launchwing-orchestrator
 
-          # Optional legacy API key auth
+          # Optional legacy auth
           if [ -n "${CF_EMAIL}" ] && [ -n "${CF_KEY}" ]; then
             yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_EMAIL   --name launchwing-orchestrator || true
             yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_API_KEY --name launchwing-orchestrator || true
             printf "%s" "$CF_EMAIL" | npx wrangler@4.28.1 secret put CLOUDFLARE_EMAIL   --name launchwing-orchestrator
             printf "%s" "$CF_KEY"   | npx wrangler@4.28.1 secret put CLOUDFLARE_API_KEY --name launchwing-orchestrator
-          else
-            echo "ℹ️ Skipping CLOUDFLARE_EMAIL/CLOUDFLARE_API_KEY; token-only auth assumed."
           fi
 
       # ------------------------------- Deploy ---------------------------------
@@ -100,15 +83,17 @@ jobs:
           curl -fsS "$URL" | tee /tmp/health.json
           jq -e '.ok == true' /tmp/health.json
 
-      # Optional: sandbox-deploy smoke (Pages mode)
-      - name: Sandbox deploy smoke (Pages mode)
+      # ✅ Sandbox smoke (ephemeral so it auto-deletes)
+      - name: Sandbox deploy smoke (Pages mode, ephemeral)
         env:
           CF_WORKERS_SUBDOMAIN: ${{ vars.CF_WORKERS_SUBDOMAIN }}
         run: |
           SUBDOMAIN="${CF_WORKERS_SUBDOMAIN:-promptpulse}"
           ORCH="https://launchwing-orchestrator.${SUBDOMAIN}.workers.dev"
-          echo "POST $ORCH/sandbox-deploy (mode=pages)"
-          curl -fsS -X POST "$ORCH/sandbox-deploy" \
+          echo "POST $ORCH/sandbox-deploy (mode=pages, ephemeral)"
+          RESP="$(curl -sS -X POST "$ORCH/sandbox-deploy" \
             -H "content-type: application/json" \
-            --data '{"confirm":true,"mode":"pages","name":"lw-sbx-ci"}' | tee /tmp/sbx.json
+            --data '{"confirm":true,"mode":"pages","ephemeral":true,"name":"lw-sbx-ci"}')"
+          echo "$RESP" | tee /tmp/sbx.json
+          # Fail only after printing the body
           jq -e '.ok == true and (.url|length>0)' /tmp/sbx.json
