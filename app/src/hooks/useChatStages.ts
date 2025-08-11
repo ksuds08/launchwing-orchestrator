@@ -1,10 +1,13 @@
+// app/src/hooks/useChatStages.ts
 import { useState, useEffect, useRef } from "react";
 import { v4 as uuidv4 } from "uuid";
-import { GREETING } from "../lib/constants";
+import type { VentureStage as StageType } from "../types";
+import { GREETING } from "../constants/messages";
+
 import { initializeIdea, updateIdea as rawUpdateIdea } from "./useIdeaLifecycle";
 import { useSendHandler } from "./useSendHandler";
 import { useStageTransition } from "./useStageTransition";
-import { useDeploymentHandler } from "./useDeploymentHandler";
+import useDeploymentHandler from "./useDeploymentHandler"; // <-- default import
 
 export default function useChatStages(onReady?: () => void) {
   const [ideas, setIdeas] = useState<any[]>([]);
@@ -16,13 +19,34 @@ export default function useChatStages(onReady?: () => void) {
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
 
-  const updateIdea = (id: any, updates: any) => rawUpdateIdea(setIdeas, id, updates);
+  const [openPanels, setOpenPanels] = useState({
+    ideation: false,
+    validation: false,
+    branding: false,
+  });
 
-  // Initialize idea with blank assistant message for streaming greeting
+  const activeIdea = ideas.find((i) => i.id === activeIdeaId);
+
+  const updateIdea = (id: any, updates: any) =>
+    rawUpdateIdea(setIdeas, id, updates);
+
+  // Initialize idea with blank assistant message
   useEffect(() => {
     if (!activeIdeaId && ideas.length === 0) {
       const id = uuidv4();
-      const starter = initializeIdea(id);
+      const starter = {
+        id,
+        title: "",
+        messages: [
+          {
+            role: "assistant" as const,
+            content: "", // for streaming
+          },
+        ],
+        locked: false,
+        currentStage: "ideation" as StageType,
+        takeaways: {},
+      };
       setIdeas([starter]);
       setActiveIdeaId(id);
     }
@@ -30,33 +54,49 @@ export default function useChatStages(onReady?: () => void) {
 
   const startGreetingStream = () => {
     if (hasStreamedGreeting || !activeIdeaId || ideas.length === 0) return;
+
+    const greeting = GREETING;
     const ideaId = activeIdeaId;
 
     const reveal = (i: number) => {
-      setIdeas(prev =>
-        prev.map(idea => {
+      setIdeas((prevIdeas) =>
+        prevIdeas.map((idea) => {
           if (idea.id !== ideaId) return idea;
+
           const updatedMessages = [...idea.messages];
-          updatedMessages[0] = { ...updatedMessages[0], content: GREETING.slice(0, i) };
+          updatedMessages[0] = {
+            ...updatedMessages[0],
+            content: greeting.slice(0, i),
+          };
+
           return { ...idea, messages: updatedMessages };
         })
       );
-      if (i < GREETING.length) requestAnimationFrame(() => reveal(i + 1));
-      else {
+
+      if (i < greeting.length) {
+        requestAnimationFrame(() => reveal(i + 1));
+      } else {
         setHasStreamedGreeting(true);
-        onReady?.();
+        if (onReady) onReady();
       }
     };
+
     requestAnimationFrame(() => reveal(1));
   };
 
   const handleAdvanceStage = useStageTransition({
-    ideas, updateIdea, setOpenPanels: () => {}, setLoading, messageEndRef
+    ideas,
+    updateIdea,
+    setOpenPanels,
+    setLoading,
+    messageEndRef,
   });
 
-  const handleConfirmBuild = useDeploymentHandler({ ideas, updateIdea, setDeployLogs });
-
-  const activeIdea = ideas.find(i => i.id === activeIdeaId);
+  const handleConfirmBuild = useDeploymentHandler({
+    ideas,
+    updateIdea,
+    setDeployLogs,
+  });
 
   const handleSend = useSendHandler({
     ideas,
@@ -66,7 +106,7 @@ export default function useChatStages(onReady?: () => void) {
     handleConfirmBuild,
     messageEndRef,
     panelRef,
-    setLoading
+    setLoading,
   });
 
   return {
@@ -75,13 +115,13 @@ export default function useChatStages(onReady?: () => void) {
     setActiveIdeaId,
     loading,
     deployLogs,
-    openPanels: { ideation: false, validation: false, branding: false },
+    openPanels,
     togglePanel: () => {},
     messageEndRef,
     panelRef,
     handleSend,
     handleAdvanceStage,
     handleConfirmBuild,
-    startGreetingStream
+    startGreetingStream,
   };
 }
