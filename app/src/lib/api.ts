@@ -1,33 +1,91 @@
 // app/src/lib/api.ts
-function normalize(path: string): string {
-  let p = (path || "").trim();
-  if (!p) return "/api";
-  if (p[0] !== "/") p = "/" + p;
-  if (p === "/api") return p;
-  if (!p.startsWith("/api/")) {
-    const idx = p.indexOf("/api/");
-    p = idx >= 0 ? p.slice(idx) : "/api" + (p.startsWith("/api") ? "" : p);
+// Minimal API helpers for the UI. Works on Cloudflare Pages where /api/* is proxied
+// to the orchestrator via the Advanced Mode worker.
+
+type Jsonish = Record<string, any> | any[] | string | number | boolean | null;
+
+function toPath(path: string): string {
+  if (!path) return "/"; // safety
+  // allow absolute URLs for diagnostics/local testing
+  if (/^https?:\/\//i.test(path)) return path;
+  return path.startsWith("/") ? path : `/${path}`;
+}
+
+async function parseJsonSafe(res: Response): Promise<any> {
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("application/json")) {
+    try {
+      return await res.json();
+    } catch {
+      // fall through
+    }
   }
-  return p;
+  const text = await res.text().catch(() => "");
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { ok: false, error: text || `HTTP ${res.status}` };
+  }
 }
 
-async function handle(r: Response) {
-  const body = await r.text().catch(() => "");
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}${body ? ` — ${body}` : ""}`);
-  const ct = r.headers.get("content-type") || "";
-  return ct.includes("application/json") ? JSON.parse(body) : body;
+export async function getJSON<T = any>(path: string, init: RequestInit = {}): Promise<T> {
+  const url = toPath(path);
+  const res = await fetch(url, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      ...(init.headers || {}),
+    },
+    ...init,
+  });
+
+  const data = (await parseJsonSafe(res)) as T;
+  if (!res.ok) {
+    const msg = (data as any)?.error || `GET ${url} failed with ${res.status}`;
+    throw new Error(msg);
+  }
+  return data;
 }
 
-export async function get(path: string) {
-  const url = normalize(path);
-  return handle(await fetch(url, { method: "GET" }));
-}
-
-export async function post(path: string, body?: unknown) {
-  const url = normalize(path); // accepts "api/mvp", "/api/mvp", "/x/api/mvp"
-  return handle(await fetch(url, {
+export async function postJSON<T = any>(path: string, body?: Jsonish, init: RequestInit = {}): Promise<T> {
+  const url = toPath(path);
+  const res = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: body == null ? undefined : JSON.stringify(body),
-  }));
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(init.headers || {}),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    ...init,
+  });
+
+  const data = (await parseJsonSafe(res)) as T;
+  if (!res.ok) {
+    const msg = (data as any)?.error || `POST ${url} failed with ${res.status}`;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+// Convenience for forms or uploads if needed later
+export async function postFormJSON<T = any>(path: string, form: FormData, init: RequestInit = {}): Promise<T> {
+  const url = toPath(path);
+  const res = await fetch(url, {
+    method: "POST",
+    body: form,
+    headers: {
+      Accept: "application/json",
+      // NOTE: do not set Content-Type; browser will set correct multipart boundary
+      ...(init.headers || {}),
+    },
+    ...init,
+  });
+
+  const data = (await parseJsonSafe(res)) as T;
+  if (!res.ok) {
+    const msg = (data as any)?.error || `POST ${url} failed with ${res.status}`;
+    throw new Error(msg);
+  }
+  return data;
 }
