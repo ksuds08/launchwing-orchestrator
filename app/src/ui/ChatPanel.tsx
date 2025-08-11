@@ -13,9 +13,11 @@ export interface ChatMessage {
   actions?: ChatAction[];
   imageUrl?: string;
 }
+
 interface ChatPanelProps {
   messages: ChatMessage[];
   onSend: (content: string) => void;
+  onDeploy?: () => void;                 // <-- new
   loading: boolean;
   idea: any;
   isActive: boolean;
@@ -26,6 +28,7 @@ interface ChatPanelProps {
 export default function ChatPanel({
   messages,
   onSend,
+  onDeploy,
   loading,
   idea,
   isActive,
@@ -54,6 +57,10 @@ export default function ChatPanel({
       sendMessage();
     }
   };
+
+  // Show Build & Deploy when we have a generated bundle OR we’re in the build stage
+  const hasBundle = !!(idea?.bundle && Object.keys(idea.bundle).length);
+  const showDeploy = hasBundle || idea?.currentStage === "build";
 
   return (
     <div
@@ -105,6 +112,23 @@ export default function ChatPanel({
           </div>
         )}
       </div>
+
+      {/* Build & Deploy button */}
+      {showDeploy && (
+        <div className="flex items-center justify-start gap-2 mb-3">
+          <button
+            className="bg-green-600 text-white font-medium px-4 py-2 rounded-md shadow-md hover:opacity-90 disabled:opacity-50 transition"
+            onClick={() => onDeploy && onDeploy()}
+            disabled={disabled || loading || !hasBundle}
+            title={hasBundle ? "Build & Deploy this bundle" : "Bundle not ready yet"}
+          >
+            Build &amp; Deploy
+          </button>
+          {!hasBundle && (
+            <span className="text-xs text-gray-500">Preparing bundle…</span>
+          )}
+        </div>
+      )}
 
       <div className="flex items-end gap-2 pt-2 border-t mt-4">
         <textarea
