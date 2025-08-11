@@ -1,5 +1,5 @@
 // src/utils/cloudflare.ts
-// Worker-safe Cloudflare deploy helpers — Services API + workers_dev enable + readiness poll
+// Cloudflare Services API deploy (Worker-safe)
 
 export interface DeployResult {
   ok: boolean;
@@ -20,9 +20,8 @@ interface EnvLike {
 
 type CfResp = { ok: boolean; status: number; json: any; raw: string };
 
-function buildAuthHeaders(env: EnvLike): Record<string, string> {
+function authHeaders(env: EnvLike): Record<string, string> {
   if (env.CLOUDFLARE_EMAIL && env.CLOUDFLARE_API_KEY) {
-    // Prefer Global API Key (most reliable across accounts)
     return {
       "X-Auth-Email": env.CLOUDFLARE_EMAIL,
       "X-Auth-Key": env.CLOUDFLARE_API_KEY,
@@ -37,22 +36,23 @@ function buildAuthHeaders(env: EnvLike): Record<string, string> {
 }
 
 async function cf(env: EnvLike, url: string, init: RequestInit): Promise<CfResp> {
-  const headers: Record<string, string> = {
-    ...buildAuthHeaders(env),
-    ...(init.headers as Record<string, string> | undefined),
-  };
-  const res = await fetch(url, { ...init, headers });
+  // Merge headers, making sure auth wins and we DON'T force a content-type for multipart bodies.
+  const h = new Headers(init.headers || {});
+  const a = authHeaders(env);
+  for (const k of Object.keys(a)) h.set(k, a[k]);
+
+  const res = await fetch(url, { ...init, headers: h });
   const raw = await res.text();
   let json: any = {};
   try {
     json = JSON.parse(raw);
   } catch {
-    // leave json as {}
+    // some endpoints can return empty bodies; keep json as {}
   }
   return { ok: res.ok, status: res.status, json, raw };
 }
 
-function msg(r: CfResp, fallback: string) {
+function errMsg(r: CfResp, fallback: string) {
   return (
     r.json?.errors?.[0]?.message ||
     r.json?.messages?.[0]?.message ||
@@ -61,12 +61,12 @@ function msg(r: CfResp, fallback: string) {
 }
 
 /**
- * Upload a single-file **Module Worker** via the Services API, enable workers.dev,
- * and wait until the URL serves (health/root).
+ * Upload a single-file **module worker** to a Cloudflare **Service**,
+ * enable workers.dev (multipart PATCH), and wait for readiness.
  *
- * @param serviceName  the Worker service name to create/update
- * @param code         ES module source for the worker's main module (string)
- * @param env          environment vars (secrets)
+ * @param serviceName name of the service to create/update
+ * @param code        ES module source for the main entry (index.js)
+ * @param env         credentials + account/subdomain values
  */
 export async function uploadModuleWorker(
   serviceName: string,
@@ -86,13 +86,16 @@ export async function uploadModuleWorker(
   {
     const r = await cf(env, base, { method: "PUT" });
     if (!r.ok && r.status !== 409) {
-      return { ok: false, error: msg(r, "Create service failed"), status: r.status, endpoint: base };
+      return { ok: false, error: errMsg(r, "Create service failed"), status: r.status, endpoint: base };
     }
   }
 
   // 2) Upload module code to production (multipart: metadata + index.js)
   {
-    const metadata = { main_module: "index.js", compatibility_date: "2024-11-01" };
+    const metadata = {
+      main_module: "index.js",
+      compatibility_date: "2024-11-01",
+    };
 
     const fd = new FormData();
     fd.append(
@@ -107,37 +110,39 @@ export async function uploadModuleWorker(
     );
 
     const url = `${base}/environments/production/script`;
-    const r = await cf(env, url, { method: "PUT", body: fd });
+    const r = await cf(env, url, { method: "PUT", body: fd }); // let FormData set content-type
     if (!r.ok) {
-      return { ok: false, error: msg(r, "Upload script failed"), status: r.status, endpoint: url };
+      return { ok: false, error: errMsg(r, "Upload script failed"), status: r.status, endpoint: url };
     }
   }
 
-  // 3) Enable workers.dev on production (JSON body)
+  // 3) Enable workers.dev (some accounts require multipart here)
   {
     const url = `${base}/environments/production/settings`;
-    const r = await cf(env, url, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workers_dev: true }),
-    });
+    const fd = new FormData();
+    fd.append(
+      "settings",
+      new Blob([JSON.stringify({ workers_dev: true })], { type: "application/json" }),
+      "settings.json"
+    );
+    const r = await cf(env, url, { method: "PATCH", body: fd });
     if (!r.ok) {
-      return { ok: false, error: msg(r, "Enable workers_dev failed"), status: r.status, endpoint: url };
+      return { ok: false, error: errMsg(r, "Enable workers_dev failed"), status: r.status, endpoint: url };
     }
   }
 
+  // Construct workers.dev URL if subdomain is known
   const url = subdomain ? `https://${serviceName}.${subdomain}.workers.dev/` : undefined;
 
-  // 4) Readiness: poll /api/health then root (avoid CF placeholder)
+  // 4) Readiness: poll /api/health and then root to dodge the placeholder page
   if (url) {
     const ready = await waitForReadiness(url);
     if (!ready) {
-      // Return the URL anyway; likely propagation; caller can retry
       return {
         ok: false,
-        error: "Deployed, workers.dev enabled, but not serving yet (propagation). Try again shortly.",
         url,
         status: 200,
+        error: "Deployed, workers.dev enabled, but not serving yet (propagation). Try again shortly.",
       };
     }
   }
@@ -145,21 +150,21 @@ export async function uploadModuleWorker(
   return { ok: true, name: serviceName, url };
 }
 
-async function waitForReadiness(base: string): Promise<boolean> {
-  const healthUrl = new URL("/api/health", base).toString();
-  const isPlaceholder = (html: string) =>
-    /There is nothing here yet/i.test(html) ||
-    (/workers\.dev/i.test(html) && /nothing here/i.test(html));
+async function waitForReadiness(baseUrl: string): Promise<boolean> {
+  const healthUrl = new URL("/api/health", baseUrl).toString();
+  const placeholder = /There is nothing here yet/i;
 
   for (let i = 0; i < 20; i++) {
     try {
+      // check health
       const h = await fetch(healthUrl as any, { cf: { cacheTtl: 0 } as any });
       if (h.ok) return true;
 
-      const r = await fetch(base as any, { cf: { cacheTtl: 0 } as any });
+      // check root (avoid placeholder)
+      const r = await fetch(baseUrl as any, { cf: { cacheTtl: 0 } as any });
       if (r.ok) {
         const html = await r.text();
-        if (!isPlaceholder(html)) return true;
+        if (!placeholder.test(html)) return true;
       }
     } catch {
       // ignore and retry
