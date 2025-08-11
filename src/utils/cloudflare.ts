@@ -1,126 +1,111 @@
-// Cloudflare Workers deploy helpers — Scripts API upload + workers.dev (settings multipart) + robust readiness poll
+// src/utils/cloudflare.ts
+import fs from "node:fs";
+import path from "node:path";
+import mime from "mime";
 
-export interface DeployResult {
-  ok: boolean;
-  name?: string;
-  url?: string;
-  error?: string;
-  status?: number;
-  endpoint?: string;
+const CF_API_BASE = "https://api.cloudflare.com/client/v4";
+
+function cfHeaders() {
+  const email = process.env.CLOUDFLARE_EMAIL;
+  const key = process.env.CLOUDFLARE_API_KEY;
+  const token = process.env.CLOUDFLARE_API_TOKEN;
+
+  if (email && key) {
+    // Global API Key auth
+    return {
+      "X-Auth-Email": email,
+      "X-Auth-Key": key
+    };
+  }
+  if (token) {
+    // Bearer API token auth
+    return {
+      Authorization: `Bearer ${token}`
+    };
+  }
+  throw new Error("No Cloudflare API credentials found");
 }
 
-interface EnvLike {
-  CLOUDFLARE_API_TOKEN?: string;
-  CLOUDFLARE_ACCOUNT_ID?: string;
-  CF_WORKERS_SUBDOMAIN?: string;
+async function cfFetch(endpoint: string, opts: RequestInit = {}) {
+  const headers = {
+    ...cfHeaders(),
+    "Content-Type": "application/json",
+    ...opts.headers
+  };
+  const res = await fetch(`${CF_API_BASE}${endpoint}`, { ...opts, headers });
+  const text = await res.text();
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`Non-JSON response from Cloudflare: ${text}`);
+  }
+  if (!json.success) {
+    const err = json.errors?.[0]?.message || JSON.stringify(json.errors || json);
+    throw new Error(err);
+  }
+  return json.result;
 }
 
-type CfResp = { ok: boolean; status: number; json: any; raw: string };
+export async function ensureService(accountId: string, serviceName: string) {
+  try {
+    await cfFetch(`/accounts/${accountId}/workers/services/${serviceName}`);
+    return; // exists
+  } catch {
+    await cfFetch(`/accounts/${accountId}/workers/services/${serviceName}`, {
+      method: "POST",
+      body: JSON.stringify({ name: serviceName })
+    });
+  }
+}
 
-async function cf(token: string, url: string, init: RequestInit): Promise<CfResp> {
-  const res = await fetch(url, {
-    ...init,
-    headers: { Authorization: `Bearer ${token}`, ...(init.headers || {}) },
+export async function uploadToService(
+  accountId: string,
+  serviceName: string,
+  env: string,
+  dir: string
+) {
+  const scriptPath = path.join(dir, "index.js");
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`Script not found: ${scriptPath}`);
+  }
+  const content = fs.readFileSync(scriptPath);
+
+  const metadata = {
+    main_module: "index.js"
+  };
+
+  const form = new FormData();
+  form.append("metadata", JSON.stringify(metadata), {
+    contentType: "application/json"
   });
-  const raw = await res.text();
-  let json: any = {};
-  try { json = JSON.parse(raw); } catch {}
-  return { ok: res.ok, status: res.status, json, raw };
-}
+  form.append("index.js", new Blob([content]), {
+    contentType: mime.getType("js") || "application/javascript"
+  });
 
-function errMsg(r: CfResp, fallback: string) {
-  return (
-    r.json?.errors?.[0]?.message ||
-    r.json?.messages?.[0]?.message ||
-    `${fallback} (${r.status}) :: ${r.raw.slice(0, 200)}`
+  const headers = cfHeaders(); // no JSON content-type here
+
+  const res = await fetch(
+    `${CF_API_BASE}/accounts/${accountId}/workers/services/${serviceName}/environments/${env}/script`,
+    { method: "PUT", headers, body: form as any }
   );
+  const json = await res.json();
+  if (!json.success) {
+    throw new Error(json.errors?.[0]?.message || JSON.stringify(json.errors));
+  }
+  return json.result;
 }
 
-export async function uploadModuleWorker(
-  scriptName: string,
-  code: string,
-  env: EnvLike
-): Promise<DeployResult> {
-  const token = env.CLOUDFLARE_API_TOKEN;
-  const accountId = env.CLOUDFLARE_ACCOUNT_ID;
-  const subdomain = env.CF_WORKERS_SUBDOMAIN;
-
-  if (!token || !accountId) {
-    return { ok: false, error: "Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID" };
-  }
-
-  const base = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(
-    scriptName
-  )}`;
-
-  // 1) Upload module (multipart: metadata + index.js)
-  {
-    const metadata = { main_module: "index.js", compatibility_date: "2024-11-01" };
-    const fd = new FormData();
-    fd.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
-    fd.append("index.js", new Blob([code], { type: "application/javascript+module" }), "index.js");
-
-    const r = await cf(token, base, { method: "PUT", body: fd });
-    if (!r.ok) return { ok: false, error: errMsg(r, "Upload script failed"), status: r.status, endpoint: base };
-  }
-
-  // 2) Enable workers.dev (multipart with a part named **settings**)
-  {
-    const settingsUrl = `${base}/settings`;
-    const form = new FormData();
-    form.append(
-      "settings",
-      new Blob([JSON.stringify({ workers_dev: true })], { type: "application/json" }),
-      "settings.json"
-    );
-    const r = await cf(token, settingsUrl, { method: "PATCH", body: form });
-    if (!r.ok) return { ok: false, error: errMsg(r, "Enable workers_dev failed"), status: r.status, endpoint: settingsUrl };
-  }
-
-  // 3) Compute workers.dev URL
-  const url = subdomain ? `https://${scriptName}.${subdomain}.workers.dev/` : undefined;
-  if (!url) return { ok: true, name: scriptName, url: undefined };
-
-  // 4) Readiness poll: prefer /api/health; fall back to root placeholder detection
-  const healthy = await waitForReadiness(url);
-  if (!healthy) {
-    // Return URL so you can check manually; usually propagates a bit later
-    return { ok: false, error: "Deployed, route enabled, but not serving yet (likely propagation). Try again shortly.", url, status: 200 };
-  }
-
-  return { ok: true, name: scriptName, url };
-}
-
-async function waitForReadiness(base: string): Promise<boolean> {
-  const healthUrl = new URL("/api/health", base).toString();
-  const rootUrl = base;
-
-  const isPlaceholder = (html: string) =>
-    /There is nothing here yet/i.test(html) || /workers\.dev/i.test(html) && /nothing here/i.test(html);
-
-  const attempts = 30;     // ~90s total
-  for (let i = 0; i < attempts; i++) {
-    try {
-      // 1) Try health
-      const h = await fetch(healthUrl as any, { cf: { cacheTtl: 0 } as any });
-      if (h.ok) return true;
-
-      // 2) Try root and ensure it's not the CF placeholder
-      const r = await fetch(rootUrl as any, { cf: { cacheTtl: 0 } as any });
-      if (r.ok) {
-        const text = await r.text();
-        if (!isPlaceholder(text)) return true;
-      }
-    } catch {
-      // ignore network hiccups and retry
+export async function enableWorkersDev(
+  accountId: string,
+  serviceName: string,
+  env: string
+) {
+  await cfFetch(
+    `/accounts/${accountId}/workers/services/${serviceName}/environments/${env}/settings`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ workers_dev: true })
     }
-    await new Promise(res => setTimeout(res, 3000)); // 3s backoff
-  }
-  return false;
-}
-
-/** Short, URL-safe id for script names */
-export function shortId(): string {
-  const n = crypto.getRandomValues(new Uint32Array(1))[0];
-  return n.toString(36).slice(0, 8);
+  );
 }
