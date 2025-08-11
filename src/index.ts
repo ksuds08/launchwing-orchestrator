@@ -5,11 +5,20 @@ import { githubExportHandler } from "@api/github-export";
 import { json } from "@utils/log";
 
 export interface Env {
+  // Cloudflare + deploy
   CLOUDFLARE_API_TOKEN?: string;
   CLOUDFLARE_ACCOUNT_ID?: string;
   CF_WORKERS_SUBDOMAIN?: string;
+
+  // CORS
   // If set, we’ll use this exact origin; otherwise default to "*"
   ALLOW_ORIGIN?: string;
+
+  // OpenAI
+  OPENAI_API_KEY?: string;
+  OPENAI_MODEL?: string;
+
+  // Static assets binding (Pages)
   ASSETS: Fetcher;
 }
 
@@ -32,12 +41,14 @@ function normalizePath(pathname: string): string {
 function corsHeaders(env: Env, req?: Request): Record<string, string> {
   const origin = env.ALLOW_ORIGIN ?? "*";
   // Reflect requested headers if present (helps avoid strict preflights)
-  const acrh = req?.headers.get("Access-Control-Request-Headers") || "Content-Type, Authorization, X-Requested-With";
+  const acrh =
+    req?.headers.get("Access-Control-Request-Headers") ||
+    "Content-Type, Authorization, X-Requested-With";
   return {
     "Access-Control-Allow-Origin": origin,
     "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": acrh,
-    "Vary": "Origin",
+    Vary: "Origin",
     "x-lw-orch": "true", // diagnostic
   };
 }
@@ -65,11 +76,27 @@ const routes: Record<
   }
 > = {
   "/": {
-    methods: { GET: async () => json({ ok: true }) }, // health at root
+    methods: { GET: async () => json({ ok: true }) }, // simple root health
     allow: ["GET", "OPTIONS"],
   },
   "/health": {
-    methods: { GET: async () => json({ ok: true }), POST: async () => json({ ok: true }) },
+    methods: {
+      GET: async (_req, env) =>
+        json({
+          ok: true,
+          hasOpenAI: Boolean(env.OPENAI_API_KEY),
+          model: env.OPENAI_MODEL || null,
+          version: "openai-mvp-v1",
+        }),
+      // keep POST permissive for probes/tools
+      POST: async (_req, env) =>
+        json({
+          ok: true,
+          hasOpenAI: Boolean(env.OPENAI_API_KEY),
+          model: env.OPENAI_MODEL || null,
+          version: "openai-mvp-v1",
+        }),
+    },
     allow: ["GET", "POST", "OPTIONS"],
   },
   "/mvp": {
