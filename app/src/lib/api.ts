@@ -1,13 +1,21 @@
 // Calls the Pages origin (which proxies /api/* to the Worker via Pages Functions)
+function normalize(p: string) {
+  if (!p) return "/api";
+  // ensure leading slash
+  if (p[0] !== "/") p = "/" + p;
+  // ensure it begins with /api/
+  if (!p.startsWith("/api/") && p !== "/api") p = "/api" + (p.startsWith("/api") ? "" : p);
+  return p;
+}
+
 export async function post(path: string, body?: unknown) {
-  // expect path like "/api/mvp"
-  const r = await fetch(path, {
+  const url = normalize(path); // e.g. "/api/mvp"
+  const r = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!r.ok) {
-    // include response text for easier debugging in UI
     const txt = await r.text().catch(() => "");
     throw new Error(`HTTP ${r.status} ${r.statusText}${txt ? ` — ${txt}` : ""}`);
   }
