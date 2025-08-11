@@ -88,8 +88,8 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
 
     // --- System / developer guidance for the model ---
     const sys = [
-      "You are an expert product+full‑stack generator for Cloudflare Pages (Advanced Mode) apps.",
-      "Produce a minimal, production‑ready bundle that can be deployed via Cloudflare Pages Direct Upload.",
+      "You are an expert product+full-stack generator for Cloudflare Pages (Advanced Mode) apps.",
+      "Produce a minimal, production-ready bundle that can be deployed via Cloudflare Pages Direct Upload.",
       "Constraints:",
       "- Avoid frameworks or build steps; output plain files (HTML, JS, CSS) and tiny server code only if necessary.",
       "- If the app needs API, include routes handled via a Pages Advanced Mode Worker `_worker.js` or proxy `/api/*` to an orchestrator URL placeholder.",
@@ -185,7 +185,7 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
     result.smoke ||= { passed: true, logs: [] };
 
     const MAX_FILES = 50;
-    const MAX_BYTES = 300_000; // ~300 KB of UTF‑8 text
+    const MAX_BYTES = 300_000; // ~300 KB of UTF-8 text
     const enc = new TextEncoder();
     const outFiles: Record<string, string> = {};
     let total = 0;
@@ -204,7 +204,8 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
 
     result.files = outFiles;
 
-    return json({ ok: true, result });
+    // *** Updated return with version tag ***
+    return json({ ok: true, result, via: "openai-mvp-v1" });
   } catch (err: any) {
     return json({ ok: false, error: String(err?.message || err || "unknown error") }, 500);
   }
