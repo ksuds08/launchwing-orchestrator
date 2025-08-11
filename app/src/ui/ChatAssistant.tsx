@@ -15,6 +15,7 @@ export default function ChatAssistant({ onReady, onInitGreeting }: ChatAssistant
     loading,
     messageEndRef,
     handleSend,
+    handleConfirmBuild, // <-- deploy handler
     startGreetingStream,
   } = useChatStages(onReady);
 
@@ -34,6 +35,11 @@ export default function ChatAssistant({ onReady, onInitGreeting }: ChatAssistant
               onSend={(msg) => {
                 setActiveIdeaId(idea.id);
                 handleSend(msg);
+              }}
+              onDeploy={() => {
+                setActiveIdeaId(idea.id);
+                // trigger deploy of this idea’s generated bundle
+                handleConfirmBuild({ id: idea.id });
               }}
               loading={loading && idea.id === activeIdeaId}
               idea={idea}
