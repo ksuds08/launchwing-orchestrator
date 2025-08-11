@@ -7,5 +7,7 @@ directory = "public"
 binding = "ASSETS"
 
 [vars]
-# Non-secret; safe to commit
+# Non-secret vars (safe to commit)
 CF_WORKERS_SUBDOMAIN = "promptpulse"
+# Make sandbox deploys default to Cloudflare Pages (Advanced Mode)
+DEFAULT_DEPLOY_MODE = "pages"
