@@ -28,9 +28,7 @@ async function postJSON<T = any>(url: string, body: unknown): Promise<T> {
 }
 
 function scrollToEnd(ref: React.RefObject<HTMLDivElement>) {
-  try {
-    ref.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  } catch { /* noop */ }
+  try { ref.current?.scrollIntoView({ behavior: "smooth", block: "end" }); } catch {}
 }
 
 function withActions(msg: any, actions: Array<{ label: string; command: string }>) {
@@ -46,7 +44,7 @@ async function streamText(
   const len = finalText.length;
   let i = 0;
   while (i < len) {
-    const step = 30 + Math.floor(Math.random() * 30); // 30..60
+    const step = 30 + Math.floor(Math.random() * 30);
     i = Math.min(i + step, len);
     onChunk(finalText.slice(0, i));
     await new Promise((r) => setTimeout(r, 25));
@@ -62,9 +60,8 @@ function serializeHistory(messages: Array<{ role: string; content: string }>, ma
     const m = messages[i];
     const role = (m.role === "assistant" || m.role === "user") ? m.role : "user";
     const content = String(m.content || "");
-    const newTotal = total + content.length;
+    total += content.length;
     out.push({ role, content });
-    total = newTotal;
     if (total >= maxChars) break;
   }
   return out.reverse();
@@ -105,8 +102,6 @@ function buildAssistantMarkdown(data: any): string {
 
 export function useSendHandler(args: Args) {
   const { ideas, activeIdea, updateIdea, messageEndRef, setLoading } = args;
-
-  // Per-idea files (what /mvp returned last)
   const filesByIdea = useRef<Map<string, Record<string, string>>>(new Map());
 
   // Handles /build command
@@ -119,7 +114,7 @@ export function useSendHandler(args: Args) {
     try {
       const files = filesByIdea.current.get(threadId);
       const resp = await postJSON<{ ok: boolean; url?: string; name?: string; error?: string }>(
-        "/sandbox-deploy",
+        "/api/sandbox-deploy",
         { confirm: true, mode: "pages", files }
       );
 
@@ -173,7 +168,6 @@ export function useSendHandler(args: Args) {
     if (!activeIdea) return;
     const id = activeIdea.id;
 
-    // Slash command: /build
     if (content.trim().toLowerCase() === "/build") {
       setLoading(true);
       await handleBuildCommand(id);
@@ -186,14 +180,14 @@ export function useSendHandler(args: Args) {
     setLoading(true);
     scrollToEnd(messageEndRef);
 
-    // 2) Placeholder assistant for streaming plan
+    // 2) Placeholder assistant
     let thread = (ideas.find((i) => i.id === id) ?? activeIdea)?.messages ?? [];
     const placeholder = { role: "assistant", content: "" };
     updateIdea(id, { messages: [...thread, placeholder] });
     scrollToEnd(messageEndRef);
 
     try {
-      // Build compact history to send with /mvp
+      // Send compact history with the request
       thread = (ideas.find((i) => i.id === id) ?? activeIdea)?.messages ?? [];
       const history = serializeHistory(thread);
 
@@ -203,7 +197,7 @@ export function useSendHandler(args: Args) {
         error?: string;
       };
 
-      const data = await postJSON<MvpResp>("/mvp", { idea: content, thread: history, ideaId: id });
+      const data = await postJSON<MvpResp>("/api/mvp", { idea: content, thread: history, ideaId: id });
 
       // Save files for this idea for the /build step
       if (data?.ok && data.result?.files) {
