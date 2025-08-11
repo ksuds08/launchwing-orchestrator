@@ -19,11 +19,11 @@ type Args = {
 
 /**
  * Handles the “Confirm Build/Deploy” action for an idea:
- *  1) Calls /mvp to produce IR/manifest (server-side)
- *  2) Calls /sandbox-deploy to ship a minimal service
+ *  1) Calls /api/mvp to produce IR/manifest (server-side)
+ *  2) Calls /api/sandbox-deploy to ship a minimal service
  *  3) Updates the idea with the deployed URL, locks the convo
  *
- * All network goes through post() → respects VITE_API_BASE
+ * All network goes through post() → relative to Pages origin (proxied to Worker).
  */
 export default function useDeploymentHandler({
   ideas,
@@ -44,7 +44,7 @@ export default function useDeploymentHandler({
 
       try {
         appendLog("🔧 Generating MVP (server)...");
-        // Minimal payload for /mvp — tweak as your API expects
+        // Minimal payload for /api/mvp — tweak as your API expects
         const ideaSummary =
           idea.title?.trim() ||
           idea.messages
@@ -54,7 +54,7 @@ export default function useDeploymentHandler({
             .join("\n\n");
 
         const mvpPayload = { idea: ideaSummary };
-        const mvp = await post("/mvp", mvpPayload as any);
+        const mvp = await post("/api/mvp", mvpPayload as any);
         appendLog("✅ MVP generated.");
 
         // Try to print a quick summary if present
@@ -71,11 +71,8 @@ export default function useDeploymentHandler({
         }
 
         appendLog("🚀 Deploying to Cloudflare (sandbox)...");
-        // /sandbox-deploy expects at least a service name; we’ll let the server derive one
-        const deployPayload = {
-          mvp, // pass through — server can pick what it needs
-        };
-        const deployRes = await post("/sandbox-deploy", deployPayload as any);
+        // /api/sandbox-deploy expects at least mvp; server derives name/details
+        const deployRes = await post("/api/sandbox-deploy", { mvp } as any);
 
         const url: string | undefined =
           deployRes?.url ||
