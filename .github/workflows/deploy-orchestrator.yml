@@ -32,29 +32,35 @@ jobs:
       - name: Lint (non-blocking)
         run: npm run lint || true
 
-      # -------- Inject CF token + account id (used by wrangler-action and as runtime fallback) --------
-      - name: Set Worker Secrets (token + account)
+      # ---------- Inject all Worker secrets (token, account, email/key) ----------
+      - name: Set Worker Secrets
         env:
-          CF_API_TOKEN:   ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ACCOUNT_ID:  ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Wrangler itself needs these present for ANY command
+          CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # These are the values we will write as secrets into the Worker
+          CF_EMAIL:              ${{ secrets.CLOUDFLARE_EMAIL }}
+          CF_KEY:                ${{ secrets.CLOUDFLARE_API_KEY }}
         run: |
           npx --yes wrangler@4.28.1 --version
-          if [ -n "${CF_API_TOKEN}" ]; then
+
+          # Token (required for wrangler to run)
+          if [ -n "${CLOUDFLARE_API_TOKEN}" ]; then
             yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator || true
-            printf "%s" "$CF_API_TOKEN" | npx wrangler@4.28.1 secret put CLOUDFLARE_API_TOKEN --name launchwing-orchestrator
-          fi
-          if [ -n "${CF_ACCOUNT_ID}" ]; then
-            yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator || true
-            printf "%s" "$CF_ACCOUNT_ID" | npx wrangler@4.28.1 secret put CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator
+            printf "%s" "$CLOUDFLARE_API_TOKEN"  | npx wrangler@4.28.1 secret put CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator
+          else
+            echo "❌ CLOUDFLARE_API_TOKEN GitHub secret is missing"; exit 1
           fi
 
-      # -------- Inject CF Global API Key + Email (preferred auth at runtime for Services API) --------
-      - name: Set Worker Secrets (global key + email)
-        env:
-          CF_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
-          CF_KEY:   ${{ secrets.CLOUDFLARE_API_KEY }}
-        run: |
-          npx --yes wrangler@4.28.1 --version
+          # Account ID (used by runtime Services API calls)
+          if [ -n "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+            yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator || true
+            printf "%s" "$CLOUDFLARE_ACCOUNT_ID" | npx wrangler@4.28.1 secret put CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator
+          else
+            echo "❌ CLOUDFLARE_ACCOUNT_ID GitHub secret is missing"; exit 1
+          fi
+
+          # Global API Key auth (preferred at runtime) – optional but recommended
           if [ -n "${CF_EMAIL}" ] && [ -n "${CF_KEY}" ]; then
             yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_EMAIL   --name launchwing-orchestrator || true
             yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_API_KEY --name launchwing-orchestrator || true
