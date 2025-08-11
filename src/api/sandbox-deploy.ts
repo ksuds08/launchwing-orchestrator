@@ -1,11 +1,11 @@
 // src/api/sandbox-deploy.ts
-// Dual-mode sandbox deploy:
+// Dual‑mode sandbox deploy:
 // - mode=pages: Direct Upload to Cloudflare Pages (Advanced Mode via _worker.js)
-// - mode=workers: Publish Worker; if workers.dev disabled/unavailable, auto-fallback to pages
+// - mode=workers: Publish Worker; if workers.dev unavailable, auto‑fallback to pages
 //
-// Requires account-level API token with scopes:
-//  - Account.Cloudflare Pages: Edit
-//  - Account.Workers Scripts: Edit
+// Requires API token scopes:
+//  - Account → Cloudflare Pages: Edit
+//  - Account → Workers Scripts: Edit
 //
 import { json } from "@utils/log";
 
@@ -32,6 +32,8 @@ type DeployResult = {
 };
 
 const CF_API = "https://api.cloudflare.com/client/v4";
+
+/* ------------------------------- helpers -------------------------------- */
 
 function bearer(env: Env) {
   const token = env.CLOUDFLARE_API_TOKEN;
@@ -64,10 +66,13 @@ async function cfJSON(env: Env, url: string, init?: RequestInit): Promise<any> {
   return data?.result ?? data ?? {};
 }
 
-/**
- * Deploy a tiny SPA to Cloudflare Pages via Direct Upload with an Advanced Mode worker.
- * Returns the live URL.
- */
+function pickName(prefix: string) {
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `${prefix}-${rand}`;
+}
+
+/* ----------------------- Pages Direct Upload deploy ---------------------- */
+
 async function deployPagesDirect(env: Env, name: string): Promise<{ url: string }> {
   const account = requireAccount(env);
 
@@ -79,18 +84,16 @@ async function deployPagesDirect(env: Env, name: string): Promise<{ url: string 
         name,
         production_branch: "main",
         build_config: {
-          build_command: "",
-          destination_dir: "/",
+          build_command: "",     // direct upload
+          destination_dir: "/",  // upload files to root
         },
       }),
     });
   } catch (e: any) {
-    if (!/already exists|exists/i.test(String(e?.message || e))) {
-      throw e;
-    }
+    if (!/already exists|exists/i.test(String(e?.message || e))) throw e;
   }
 
-  // 2) Minimal SPA + Advanced Mode worker that proxies /api/* back to orchestrator
+  // 2) Minimal SPA + Advanced Mode worker that proxies /api/* to orchestrator
   const ORCH =
     env.ORCHESTRATOR_URL || "https://launchwing-orchestrator.promptpulse.workers.dev";
 
@@ -178,39 +181,26 @@ export default {
   },
 };`;
 
-  // 3) Direct Upload (multipart form-data: manifest + files)
   const files: Record<string, string> = {
     "index.html": indexHtml,
     "_worker.js": workerJs,
   };
 
-  const boundary = "----lwpages" + Math.random().toString(36).slice(2);
-  const parts: Uint8Array[] = [];
+  // 3) ✅ Direct Upload via FormData + File (Workers sets multipart boundary)
   const enc = new TextEncoder();
-
-  function push(s: string) { parts.push(enc.encode(s)); }
 
   const manifest = {
     files: Object.fromEntries(
-      Object.entries(files).map(([path, content]) => [path, { size: new Blob([content]).size }])
+      Object.entries(files).map(([path, content]) => [path, { size: enc.encode(content).length }])
     ),
   };
 
-  push(`--${boundary}\r\n`);
-  push(`Content-Disposition: form-data; name="manifest"\r\n`);
-  push(`Content-Type: application/json\r\n\r\n`);
-  push(JSON.stringify(manifest) + "\r\n");
-
+  const fd = new FormData();
+  fd.set("manifest", new File([JSON.stringify(manifest)], "manifest.json", { type: "application/json" }));
   for (const [path, content] of Object.entries(files)) {
-    push(`--${boundary}\r\n`);
-    push(`Content-Disposition: form-data; name="${path}"; filename="${path}"\r\n`);
-    push(`Content-Type: ${path.endsWith(".js") ? "application/javascript" : "text/html"}\r\n\r\n`);
-    push(content);
-    push(`\r\n`);
+    const type = path.endsWith(".js") ? "application/javascript" : "text/html";
+    fd.set(path, new File([content], path, { type }));
   }
-  push(`--${boundary}--\r\n`);
-
-  const body = new Blob(parts, { type: `multipart/form-data; boundary=${boundary}` });
 
   const dep = await fetch(
     `${CF_API}/accounts/${account}/pages/projects/${encodeURIComponent(name)}/deployments`,
@@ -218,9 +208,9 @@ export default {
       method: "POST",
       headers: {
         ...bearer(env),
-        // Do not set content-type manually for Blob; fetch sets boundary.
+        // DO NOT set content-type; Workers runtime will add boundary automatically
       },
-      body,
+      body: fd,
     }
   );
 
@@ -239,7 +229,8 @@ export default {
   return { url };
 }
 
-/** Minimal Workers script upload (no workers.dev toggle here) */
+/* --------------------------- Worker deploy (opt) ------------------------- */
+
 async function deployWorker(env: Env, name: string): Promise<{ url?: string }> {
   const account = requireAccount(env);
   const code = `export default { fetch() { return new Response("OK: ${name}", {status: 200}); } };`;
@@ -263,10 +254,7 @@ async function deployWorker(env: Env, name: string): Promise<{ url?: string }> {
   return { url: undefined };
 }
 
-function pickName(prefix: string) {
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `${prefix}-${rand}`;
-}
+/* -------------------------------- handler -------------------------------- */
 
 export async function sandboxDeployHandler(req: Request, env: Env): Promise<Response> {
   try {
@@ -285,7 +273,7 @@ export async function sandboxDeployHandler(req: Request, env: Env): Promise<Resp
       try {
         const w = await deployWorker(env, name);
         if (!w.url) {
-          // No URL → auto-fallback to Pages for a usable preview
+          // No public URL -> auto-fallback to Pages so user gets a usable endpoint
           const p = await deployPagesDirect(env, name);
           const res: DeployResult = { ok: true, name, url: p.url, fallback: "pages" };
           return json(res);
@@ -303,7 +291,7 @@ export async function sandboxDeployHandler(req: Request, env: Env): Promise<Resp
       }
     }
 
-    // Default path: Pages (Advanced Mode)
+    // Default: Pages (Advanced Mode)
     const p = await deployPagesDirect(env, name);
     const res: DeployResult = { ok: true, name, url: p.url };
     return json(res);
