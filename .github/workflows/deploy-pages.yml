@@ -25,18 +25,27 @@ jobs:
       - name: Build SPA → app/dist
         run: npm run -w app build
 
-      # 🔧 Inject Pages Advanced Mode worker that proxies /api/* to orchestrator
-      - name: Write _worker.ts (Pages Advanced proxy)
+      # 🔧 Inject Pages Advanced Mode worker (handles OPTIONS + proxies /api/*)
+      - name: Write _worker.js (Pages Advanced proxy with CORS)
         run: |
-          cat > app/dist/_worker.ts <<'TS'
-          export interface Env {
-            ASSETS: Fetcher; // auto-bound by Pages
-          }
-
+          cat > app/dist/_worker.js <<'JS'
           const ORCH = "https://launchwing-orchestrator.promptpulse.workers.dev";
 
-          async function serveSPA(req: Request, env: Env) {
-            // try the exact asset first
+          function corsHeaders() {
+            return {
+              "Access-Control-Allow-Origin": "*",
+              "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+              "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+              "Vary": "Origin",
+            };
+          }
+
+          function corsPreflight() {
+            return new Response(null, { status: 204, headers: corsHeaders() });
+          }
+
+          async function serveSPA(req, env) {
+            // Try exact asset
             const res = await env.ASSETS.fetch(req);
             if (res.status !== 404) return res;
 
@@ -49,41 +58,47 @@ jobs:
               const indexRes = await env.ASSETS.fetch(indexReq);
               if (indexRes.status !== 404) return indexRes;
             }
-
             return res;
           }
 
           export default {
-            async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+            async fetch(req, env) {
               const url = new URL(req.url);
 
-              // Proxy /api/* to orchestrator Worker
+              // Handle API routes
               if (url.pathname.startsWith("/api/")) {
+                // Respond to preflight at the edge (avoid upstream 405)
+                if (req.method === "OPTIONS") {
+                  return corsPreflight();
+                }
+
+                // Proxy to orchestrator
                 const upstream = new URL(url.pathname.replace(/^\/api/, ""), ORCH);
                 upstream.search = url.search;
 
-                const init: RequestInit = {
+                const init = {
                   method: req.method,
-                  headers: new Headers(req.headers),
+                  headers: req.headers,
+                  body: (req.method === "GET" || req.method === "HEAD") ? undefined : req.body,
+                  redirect: "manual",
                 };
-                // pass through body for non-GET/HEAD
-                if (req.method !== "GET" && req.method !== "HEAD") {
-                  init.body = await req.arrayBuffer();
-                }
 
                 const r = await fetch(upstream.toString(), init);
-                // stream back as-is
-                return new Response(r.body, {
-                  status: r.status,
-                  headers: r.headers,
-                });
+
+                // Add permissive CORS on the way back (harmless for same-origin)
+                const h = new Headers(r.headers);
+                for (const [k, v] of Object.entries(corsHeaders())) h.set(k, v);
+
+                return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
               }
 
-              // Otherwise serve SPA/assets
+              // Static/SPA
               return serveSPA(req, env);
             },
-          } satisfies ExportedHandler<Env>;
-          TS
+          };
+          JS
+
+          test -f app/dist/_worker.js || (echo "ERROR: app/dist/_worker.js missing" && exit 1)
 
       # Idempotent project creation
       - name: Create Pages project if missing
@@ -98,7 +113,7 @@ jobs:
             --production-branch main
             --compatibility-date 2024-11-01
 
-      # Deploy (Pages auto-detects _worker.ts and switches to Advanced Mode)
+      # Deploy (Pages auto-detects _worker.js and switches to Advanced Mode)
       - name: Publish to Pages (Advanced Mode)
         uses: cloudflare/wrangler-action@v3
         with:
