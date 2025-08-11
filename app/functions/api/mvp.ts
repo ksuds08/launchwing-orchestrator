@@ -29,40 +29,45 @@ type MvpResult = {
 };
 
 const ORCH = "https://launchwing-orchestrator.promptpulse.workers.dev";
-const INJECTED_WORKER_TS = `export default {
+
+// Plain JS worker (Pages Direct Upload won’t transpile TS)
+const INJECTED_WORKER_JS = `export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     const ORCH = "${ORCH}";
-    // Proxy API (supports both /api/* and top-level endpoints)
-    const isApi = url.pathname === "/api" || url.pathname.startsWith("/api/") ||
-      url.pathname === "/mvp" || url.pathname === "/health" ||
-      url.pathname === "/github-export" || url.pathname === "/sandbox-deploy";
+
+    const isApi =
+      url.pathname === "/api" ||
+      url.pathname.startsWith("/api/") ||
+      url.pathname === "/mvp" ||
+      url.pathname === "/health" ||
+      url.pathname === "/github-export" ||
+      url.pathname === "/sandbox-deploy";
+
+    if (isApi && req.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+          "Vary": "Origin"
+        }
+      });
+    }
 
     if (isApi) {
-      if (req.method === "OPTIONS") {
-        return new Response(null, {
-          status: 204,
-          headers: {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
-            "Vary": "Origin",
-          }
-        });
-      }
-      // Normalize to upstream path (strip /api)
-      const upstreamPath = url.pathname === "/api"
-        ? "/"
-        : url.pathname.startsWith("/api/")
-          ? url.pathname.slice(4)
-          : url.pathname;
+      const upstreamPath =
+        url.pathname === "/api" ? "/" :
+        url.pathname.startsWith("/api/") ? url.pathname.slice(4) :
+        url.pathname;
 
       const upstream = new URL(upstreamPath + url.search, ORCH);
       const init = {
         method: req.method,
         headers: req.headers,
         body: (req.method === "GET" || req.method === "HEAD") ? undefined : req.body,
-        redirect: "manual",
+        redirect: "manual"
       };
       const r = await fetch(upstream.toString(), init);
       const h = new Headers(r.headers);
@@ -149,11 +154,11 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
       "Constraints:",
       "- Avoid frameworks or build steps; output plain files (HTML, JS, CSS) and tiny server code only if necessary.",
       "- Use relative API paths (e.g., `/api/mvp`, `/api/health`).",
-      "- If the app needs API, include routes handled via a Pages Advanced Mode Worker `_worker.ts` OR assume a proxy will map `/api/*` to the orchestrator.",
+      "- If the app needs API, include routes handled via a Pages Advanced Mode Worker `_worker.js`, or assume a proxy will map `/api/*` to the orchestrator.",
       "- Keep total bundle size small; inline assets where reasonable; no external package managers.",
       "Quality bar:",
       "- Code should run without modification after upload.",
-      "- Keep file paths stable and flat (e.g., `index.html`, `app.js`, `_worker.ts`).",
+      "- Keep file paths stable and flat (e.g., `index.html`, `app.js`, `_worker.js`).",
       "- Comment sparingly but clearly."
     ].join("\n");
 
@@ -195,6 +200,7 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
 
     const rawText = await r.text();
     if (!r.ok) {
+      // Bubble exact error for easier debugging in UI/CI
       return json({ ok: false, error: `OpenAI HTTP ${r.status} — ${rawText}` }, 502);
     }
 
@@ -253,14 +259,14 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
       n++;
     }
 
-    // === Injection: ensure `_worker.ts` exists for dynamic API proxy ===
+    // === Injection: ensure `_worker.js` exists for dynamic API proxy ===
     const hasWorker =
-      Object.prototype.hasOwnProperty.call(outFiles, "_worker.ts") ||
-      Object.prototype.hasOwnProperty.call(outFiles, "_worker.js");
+      Object.prototype.hasOwnProperty.call(outFiles, "_worker.js") ||
+      Object.prototype.hasOwnProperty.call(outFiles, "_worker.ts"); // tolerate model output
 
     if (!hasWorker) {
-      outFiles["_worker.ts"] = INJECTED_WORKER_TS;
-      result.smoke.logs.push("Injected _worker.ts proxy → orchestrator");
+      outFiles["_worker.js"] = INJECTED_WORKER_JS;
+      result.smoke.logs.push("Injected _worker.js proxy → orchestrator");
     }
 
     result.files = outFiles;
