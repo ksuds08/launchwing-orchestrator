@@ -24,8 +24,8 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      # Optional override; otherwise mvp.ts defaults to gpt-4.1-mini
-      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }} # optional override
+      NPM_CONFIG_LEGACY_PEER_DEPS: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,10 +35,18 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install
-        run: npm ci
-        env:
-          NPM_CONFIG_LEGACY_PEER_DEPS: "true"
+      # ---- Robust install: ci if lockfile exists, otherwise install ----
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            echo "Using npm ci (package-lock.json found)"
+            npm ci
+          else
+            echo "No package-lock.json; using npm install"
+            npm install --no-audit --no-fund
+          fi
 
       - name: Build (if present)
         run: npm run build --if-present
@@ -66,7 +74,6 @@ jobs:
           printf "%s" "$CLOUDFLARE_ACCOUNT_ID" | npx wrangler@4.28.1 secret put CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator --quiet
           printf "%s" "$OPENAI_API_KEY"        | npx wrangler@4.28.1 secret put OPENAI_API_KEY        --name launchwing-orchestrator --quiet
 
-          # Optional model override
           if [ -n "${OPENAI_MODEL:-}" ]; then
             printf "%s" "$OPENAI_MODEL" | npx wrangler@4.28.1 secret put OPENAI_MODEL --name launchwing-orchestrator --quiet
           fi
@@ -76,10 +83,10 @@ jobs:
           CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          # Use wrangler.toml in repo; --name keeps it explicit
           npx --yes wrangler@4.28.1 deploy --name launchwing-orchestrator --minify
 
       - name: Verify /health
+        shell: bash
         run: |
           set -e
           URL="https://launchwing-orchestrator.promptpulse.workers.dev/health"
