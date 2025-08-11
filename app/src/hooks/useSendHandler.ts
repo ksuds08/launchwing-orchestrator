@@ -1,6 +1,6 @@
 // app/src/hooks/useSendHandler.ts
-// Calls /api/mvp and SIMULATES streaming by overwriting the assistant message
-// using ONLY plain-object updates (no functional updates).
+// Calls /api/mvp?debug=1 and SIMULATES streaming by overwriting the assistant message.
+// Renders plan + code previews + OpenAI debug payloads (truncated).
 
 import { useCallback, useRef } from "react";
 import { postJSON } from "../lib/api";
@@ -24,16 +24,20 @@ type MvpResp = {
     smoke?: { passed: boolean; logs: string[] };
   };
   error?: string;
+
+  // proof + debug
   via?: string;
   model?: string;
   oai_request_id?: string | null;
   took_ms?: number;
+  debug_payload?: string;
+  debug_raw_openai?: string;
 };
 
 type UseSendHandlerOpts = {
   ideas: any[];
   activeIdea: any | null;
-  updateIdea: (id: string, updates: any) => void; // must accept plain objects
+  updateIdea: (id: any, updates: any) => void; // plain-object updates only
   handleAdvanceStage?: (...args: any[]) => void;
   handleConfirmBuild?: (...args: any[]) => void;
   messageEndRef?: React.RefObject<HTMLDivElement>;
@@ -41,9 +45,10 @@ type UseSendHandlerOpts = {
   setLoading?: (b: boolean) => void;
 };
 
-const MAX_PREVIEW_BYTES = 4_000;    // ~4KB per file
-const MAX_PREVIEW_LINES = 120;      // or 120 lines per file
-const MAX_FILES_PREVIEW = 12;       // show up to 12 files inline
+const MAX_PREVIEW_BYTES = 4_000;
+const MAX_PREVIEW_LINES = 120;
+const MAX_FILES_PREVIEW = 12;
+const MAX_DEBUG_CHARS = 2000; // show up to ~2KB per debug block
 
 function extToLang(path: string): string {
   const p = path.toLowerCase();
@@ -102,11 +107,11 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
       };
 
       try {
-        // 2) Call orchestrator
-        const data = await postJSON<MvpResp>("/api/mvp", {
+        // 2) Call orchestrator with debug enabled
+        const data = await postJSON<MvpResp>("/api/mvp?debug=1", {
           idea: ideaText,
           ideaId: id,
-          thread: baseMsgs, // compact history
+          thread: baseMsgs,
         });
 
         if (!data?.ok) {
@@ -125,7 +130,7 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
           return;
         }
 
-        // Stash bundle and stage (object updates only)
+        // Persist bundle and stage
         filesByIdea.current.set(id, bundle);
         opts.updateIdea(id, {
           bundle,
@@ -133,7 +138,7 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
           currentStage: "build",
         });
 
-        // 4) Build transcript (with code previews)
+        // 4) Build transcript (plan + code previews + OPENAI DEBUG)
         const ir = data?.result?.ir || {};
         const logs = data?.result?.smoke?.logs || [];
         const model = data?.model || "unknown-model";
@@ -154,8 +159,8 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
           })
           .slice(0, MAX_FILES_PREVIEW);
 
-        const chunks: string[] = [];
-        const push = (s = "") => chunks.push(s);
+        const lines: string[] = [];
+        const push = (s = "") => lines.push(s);
 
         push(`🤖 **OpenAI**${via}`);
         push(`- Model: \`${model}\``);
@@ -180,6 +185,7 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
           push("Smoke logs:");
           for (const l of logs) push(`  - ${l}`);
         }
+
         push("");
         push(`### Files Generated (${fileCount} files, ~${Math.round(totalBytes / 1024)} KB)`);
         if (fileCount > ordered.length) push(`Showing first ${ordered.length} files:`);
@@ -195,9 +201,30 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
           push("");
         }
 
+        // --- DEBUG SECTION (raw OpenAI output) ---
+        if (data?.debug_payload || data?.debug_raw_openai) {
+          push("### OpenAI Debug");
+          if (data.debug_payload) {
+            const dp = String(data.debug_payload);
+            const clip = dp.length > MAX_DEBUG_CHARS ? dp.slice(0, MAX_DEBUG_CHARS) + "… (truncated)" : dp;
+            push("**Parsed payload (string)**");
+            push("```json");
+            push(clip);
+            push("```");
+          }
+          if (data.debug_raw_openai) {
+            const dr = String(data.debug_raw_openai);
+            const clip = dr.length > MAX_DEBUG_CHARS ? dr.slice(0, MAX_DEBUG_CHARS) + "… (truncated)" : dr;
+            push("**Raw OpenAI response (as returned)**");
+            push("```json");
+            push(clip);
+            push("```");
+          }
+        }
+
         push("✅ Code bundle is ready. Click **Build & Deploy** to ship it.");
 
-        const transcript = chunks.join("\n");
+        const transcript = lines.join("\n");
 
         // 5) Simulated streaming: repeatedly overwrite assistant bubble
         let i = 0;
@@ -209,7 +236,6 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
           i += step;
           setTimeout(tick, 10);
         };
-        // Seed empty assistant before streaming
         renderAssistant("");
         setTimeout(tick, 10);
       } catch (e: any) {
