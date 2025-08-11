@@ -3,6 +3,7 @@
 // - mode="pages" (default): Direct Upload to Cloudflare Pages (Advanced Mode via _worker.js)
 // - mode="workers": Publish Worker; if no public URL, auto-fallback to Pages
 // - ephemeral=true → delete the created sandbox immediately after return (via ctx.waitUntil)
+
 import { json } from "@utils/log";
 
 export interface Env {
@@ -198,8 +199,7 @@ export default {
     "_worker.js": workerJs,
   };
 
-  // 3) Direct Upload via FormData
-  //    IMPORTANT: "manifest" must be a simple string field; assets are Files.
+  // 3) Build manifest (sizes only are fine)
   const enc = new TextEncoder();
   const manifest = {
     files: Object.fromEntries(
@@ -207,24 +207,65 @@ export default {
     ),
   };
 
-  const fd = new FormData();
-  fd.append("manifest", JSON.stringify(manifest)); // <-- string field (fixes 8000096)
-
-  for (const [path, content] of Object.entries(files)) {
-    const type = path.endsWith(".js") ? "application/javascript" : "text/html";
-    fd.append(path, new File([content], path, { type }));
+  // ---------- Attempt A: FormData (manifest JSON Blob, then files) ----------
+  async function tryFormDataUpload(): Promise<Response> {
+    const fd = new FormData();
+    // manifest must be application/json and appear before files
+    fd.append("manifest", new Blob([JSON.stringify(manifest)], { type: "application/json" }));
+    for (const [path, content] of Object.entries(files)) {
+      const type = path.endsWith(".js") ? "application/javascript" : "text/html";
+      fd.append(path, new File([content], path, { type }));
+    }
+    return fetch(
+      `${CF_API}/accounts/${account}/pages/projects/${encodeURIComponent(name)}/deployments`,
+      { method: "POST", headers: { ...bearer(env) }, body: fd }
+    );
   }
 
-  const dep = await fetch(
-    `${CF_API}/accounts/${account}/pages/projects/${encodeURIComponent(name)}/deployments`,
-    {
-      method: "POST",
-      headers: { ...bearer(env) }, // do NOT set content-type; Workers adds boundary
-      body: fd,
-    }
-  );
+  // ---------- Attempt B: Manual multipart with explicit boundary ----------
+  async function tryManualMultipartUpload(): Promise<Response> {
+    const boundary = "----lwpages" + Math.random().toString(36).slice(2);
+    const CRLF = "\r\n";
+    const parts: Uint8Array[] = [];
 
-  const depText = await dep.text();
+    function pushString(s: string) { parts.push(enc.encode(s)); }
+
+    // manifest part
+    pushString(`--${boundary}${CRLF}`);
+    pushString(`Content-Disposition: form-data; name="manifest"${CRLF}`);
+    pushString(`Content-Type: application/json${CRLF}${CRLF}`);
+    pushString(JSON.stringify(manifest) + CRLF);
+
+    // file parts
+    for (const [path, content] of Object.entries(files)) {
+      const type = path.endsWith(".js") ? "application/javascript" : "text/html";
+      pushString(`--${boundary}${CRLF}`);
+      pushString(`Content-Disposition: form-data; name="${path}"; filename="${path}"${CRLF}`);
+      pushString(`Content-Type: ${type}${CRLF}${CRLF}`);
+      pushString(content);
+      pushString(CRLF);
+    }
+
+    // closing boundary
+    pushString(`--${boundary}--${CRLF}`);
+    const body = new Blob(parts, { type: `multipart/form-data; boundary=${boundary}` });
+
+    return fetch(
+      `${CF_API}/accounts/${account}/pages/projects/${encodeURIComponent(name)}/deployments`,
+      { method: "POST", headers: { ...bearer(env), "Content-Type": body.type }, body }
+    );
+  }
+
+  // ---------- Execute with fallback ----------
+  let dep = await tryFormDataUpload();
+  let depText = await dep.text();
+
+  // If the API still says manifest missing (8000096), retry with manual multipart
+  if (!dep.ok && /8000096|manifest.+expected/i.test(depText)) {
+    dep = await tryManualMultipartUpload();
+    depText = await dep.text();
+  }
+
   if (!dep.ok) throw new Error(`Pages deploy failed: HTTP ${dep.status} — ${depText}`);
 
   let depJson: any = {};
@@ -247,11 +288,7 @@ async function deployWorker(env: Env, name: string): Promise<{ url?: string }> {
 
   const r = await fetch(
     `${CF_API}/accounts/${account}/workers/scripts/${encodeURIComponent(name)}`,
-    {
-      method: "PUT",
-      headers: { "content-type": "application/javascript", ...bearer(env) },
-      body: code,
-    }
+    { method: "PUT", headers: { "content-type": "application/javascript", ...bearer(env) }, body: code }
   );
   if (!r.ok) {
     const t = await r.text();
@@ -273,9 +310,7 @@ export async function sandboxDeployHandler(
     if (!payload?.confirm) return json({ ok: false, error: "confirm=false" }, 400);
 
     const desired = (payload.mode || env.DEFAULT_DEPLOY_MODE || "pages") as "pages" | "workers";
-    const name = (payload.name || pickName("lw-sbx"))
-      .toLowerCase()
-      .replace(/[^a-z0-9\-]/g, "-");
+    const name = (payload.name || pickName("lw-sbx")).toLowerCase().replace(/[^a-z0-9\-]/g, "-");
     const ephemeral = Boolean(payload.ephemeral);
 
     if (desired === "workers") {
