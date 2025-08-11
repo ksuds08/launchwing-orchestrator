@@ -1,0 +1,48 @@
+name: Tail Orchestrator Logs
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How many minutes to tail logs"
+        required: false
+        default: "5"
+
+jobs:
+  tail:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Wrangler
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4'
+          command: version
+
+      - name: Install Wrangler (CLI for tail)
+        run: npm i -g wrangler@4
+
+      - name: Tail logs (JSON) for a limited time
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          DURATION=${{ github.event.inputs.minutes }}
+          [ -z "$DURATION" ] && DURATION=5
+          echo "Tailing logs for ${DURATION} minute(s)..."
+          # Replace with your Worker name exactly as deployed by wrangler
+          WORKER_NAME="launchwing-orchestrator"
+          # Start tail in background and kill after timeout
+          ( timeout ${DURATION}m wrangler tail $WORKER_NAME --format=json || true ) | tee tail.jsonl
+
+      - name: Upload tail logs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestrator-tail-logs
+          path: tail.jsonl
