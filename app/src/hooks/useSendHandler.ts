@@ -1,4 +1,5 @@
 import type React from "react";
+import { post } from "../lib/api";
 
 type Args = {
   ideas: any[];
@@ -10,19 +11,6 @@ type Args = {
   panelRef: React.RefObject<HTMLDivElement>;
   setLoading: (v: boolean) => void;
 };
-
-async function postJSON<T = any>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(text || "HTTP " + res.status);
-  }
-  return res.json() as Promise<T>;
-}
 
 function scrollToEnd(ref: React.RefObject<HTMLDivElement>) {
   try {
@@ -97,9 +85,9 @@ export function useSendHandler(args: Args) {
     scrollToEnd(messageEndRef);
 
     try {
-      // Kick off backend deploy
-      const resp = await postJSON<{ ok: boolean; url?: string; name?: string; error?: string }>(
-        "/sandbox-deploy",
+      // 🔒 Always call the API via /api/*
+      const resp = await post<{ ok: boolean; url?: string; name?: string; error?: string }>(
+        "/api/sandbox-deploy",
         { confirm: true }
       );
 
@@ -181,7 +169,8 @@ export function useSendHandler(args: Args) {
         error?: string;
       };
 
-      const data = await postJSON<MvpResp>("/mvp", { idea: content });
+      // 🔒 Always call through /api/*
+      const data = await post<MvpResp>("/api/mvp", { idea: content });
       const markdown = buildAssistantMarkdown(data);
 
       // 3) Stream plan content
@@ -218,3 +207,5 @@ export function useSendHandler(args: Args) {
     }
   };
 }
+
+export default useSendHandler;
