@@ -1,3 +1,4 @@
+# .github/workflows/deploy-pages.yml
 name: Deploy SPA to Cloudflare Pages
 
 on:
@@ -10,10 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NPM_CONFIG_LEGACY_PEER_DEPS: "true"
-      CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      CF_TOKEN:      ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CF_PROJECT:    "launchwing-app"   # <— pick once and keep
-
+      CF_PAGES_PROJECT: "launchwing-app"  # pick once and keep
     steps:
       - uses: actions/checkout@v4
 
@@ -21,39 +19,18 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install deps (workspaces ok, no lockfile required)
+      - name: Install deps (workspaces ok)
         run: npm install --no-audit --no-fund -ws
 
       - name: Build SPA → app/dist
         run: npm run -w app build
 
-      # Ensure Pages project exists (create if missing)
-      - name: Ensure Pages project exists
-        run: |
-          set -e
-          BASE="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects"
-          # Check
-          CODE=$(curl -s -o /tmp/pages_get.json -w "%{http_code}" \
-            -H "Authorization: Bearer ${CF_TOKEN}" \
-            "${BASE}/${CF_PROJECT}")
-          if [ "$CODE" = "404" ]; then
-            echo "Creating Pages project: ${CF_PROJECT}"
-            curl -fsS -X POST "${BASE}" \
-              -H "Authorization: Bearer ${CF_TOKEN}" \
-              -H "Content-Type: application/json" \
-              --data "{\"name\":\"${CF_PROJECT}\",\"production_branch\":\"main\"}" \
-            >/tmp/pages_create.json
-            echo "Created:"
-            cat /tmp/pages_create.json
-          else
-            echo "Pages project exists (status ${CODE})"
-          fi
-
-      - name: Publish to Pages
-        uses: cloudflare/pages-action@v1
+      # Use Wrangler to deploy Pages (creates project if missing)
+      - name: Publish to Pages (wrangler)
+        uses: cloudflare/wrangler-action@v3
         with:
           apiToken:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: ${{ env.CF_PROJECT }}
-          directory: app/dist
-          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          # v4 works too; pinning is fine if you prefer
+          wranglerVersion: "4"
+          command: pages deploy app/dist --project-name ${{ env.CF_PAGES_PROJECT }} --branch main
