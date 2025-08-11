@@ -33,12 +33,21 @@ jobs:
           apiToken:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: "4"
-          command: pages project create ${{ env.CF_PAGES_PROJECT }} --production-branch main --compatibility-date 2024-11-01
+          command: >
+            pages project create ${{ env.CF_PAGES_PROJECT }}
+            --production-branch main
+            --compatibility-date 2024-11-01
 
+      # Deploy static build + Pages Functions (app/functions)
       - name: Publish to Pages
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: "4"
-          command: pages deploy app/dist --project-name ${{ env.CF_PAGES_PROJECT }} --branch main --commit-dirty=true
+          command: >
+            pages deploy app/dist
+            --project-name ${{ env.CF_PAGES_PROJECT }}
+            --branch main
+            --functions app/functions
+            --commit-dirty=true
