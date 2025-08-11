@@ -1,5 +1,5 @@
+// app/src/hooks/useSendHandler.ts
 import type React from "react";
-import { post } from "../lib/api";
 
 type Args = {
   ideas: any[];
@@ -12,43 +12,28 @@ type Args = {
   setLoading: (v: boolean) => void;
 };
 
+async function postJSON<T = any>(url: string, body: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(text || `HTTP ${res.status}`);
+  }
+  const ct = res.headers.get("content-type") || "";
+  return ct.includes("application/json") ? (res.json() as Promise<T>) : (text as unknown as T);
+}
+
 function scrollToEnd(ref: React.RefObject<HTMLDivElement>) {
   try {
     ref.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   } catch { /* noop */ }
 }
 
-function buildAssistantMarkdown(data: any): string {
-  if (!data?.ok || !data?.result) {
-    const err = data?.error ? String(data.error) : "unknown error";
-    return "**Error:** " + err;
-  }
-  const result = data.result || {};
-  const ir = result.ir || {};
-  const manifest = result.manifest || {};
-  const smoke = result.smoke || {};
-
-  const routes = Array.isArray(ir.api_routes)
-    ? ir.api_routes.map((r: any) => (r.method + " " + r.path)).join(", ")
-    : "—";
-  const pages = Array.isArray(ir.pages) ? ir.pages.join(", ") : "—";
-  const filesCount = Array.isArray(manifest.files) ? manifest.files.length : 0;
-  const smokeLogs = Array.isArray(smoke.logs) && smoke.logs.length
-    ? "```\n" + smoke.logs.join("\n") + "\n```"
-    : "";
-
-  let s = "";
-  s += "### Plan created\n";
-  s += "**App:** " + (ir.name || "Generated App") + "  \n";
-  s += "**Type:** " + (ir.app_type || "spa_api") + "\n\n";
-  s += "**Pages:** " + pages + "  \n";
-  s += "**API Routes:** " + routes + "\n\n";
-  s += "**Files to generate:** " + String(filesCount) + "\n\n";
-  s += "### Smoke\n";
-  s += "- Passed: **" + (smoke.passed ? "yes" : "no") + "**\n";
-  if (smokeLogs) s += smokeLogs + "\n";
-  s += "\n> Next: confirm to build & deploy, or iterate on the idea.";
-  return s;
+function withActions(msg: any, actions: Array<{ label: string; command: string }>) {
+  return { ...msg, actions };
 }
 
 /** Simulated streaming writer */
@@ -68,16 +53,71 @@ async function streamText(
   onDone?.();
 }
 
-function withActions(msg: any, actions: Array<{ label: string; command: string }>) {
-  return { ...msg, actions };
+/** Serialize a thread to a compact history for the backend */
+function serializeHistory(messages: Array<{ role: string; content: string }>, maxChars = 8000) {
+  // Keep the most recent messages until ~maxChars
+  const out: Array<{ role: "user" | "assistant" | "system"; content: string }> = [];
+  let total = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    const role = (m.role === "assistant" || m.role === "user") ? m.role : "user";
+    const content = String(m.content || "");
+    const newTotal = total + content.length;
+    out.push({ role, content });
+    total = newTotal;
+    if (total >= maxChars) break;
+  }
+  return out.reverse();
 }
 
+function buildAssistantMarkdown(data: any): string {
+  if (!data?.ok || !data?.result) {
+    const err = data?.error ? String(data.error) : "unknown error";
+    return "**Error:** " + err;
+  }
+  const result = data.result || {};
+  const ir = result.ir || {};
+  const smoke = result.smoke || {};
+  const files = result.files || {};
+
+  const routes = Array.isArray(ir.api_routes)
+    ? ir.api_routes.map((r: any) => (r.method + " " + r.path)).join(", ")
+    : "—";
+  const pages = Array.isArray(ir.pages) ? ir.pages.join(", ") : "—";
+  const filesCount = Object.keys(files).length;
+  const smokeLogs = Array.isArray(smoke.logs) && smoke.logs.length
+    ? "```\n" + smoke.logs.join("\n") + "\n```"
+    : "";
+
+  let s = "";
+  s += "### Plan created\n";
+  s += "**App:** " + (ir.name || "Generated App") + "  \n";
+  s += "**Type:** " + (ir.app_type || "spa_api") + "\n\n";
+  s += "**Pages:** " + pages + "  \n";
+  s += "**API Routes:** " + routes + "\n\n";
+  s += "**Files to generate:** " + String(filesCount) + "\n\n";
+  s += "### Smoke\n";
+  s += "- Passed: **" + (smoke.passed ? "yes" : "no") + "**\n";
+  if (smokeLogs) s += smokeLogs + "\n";
+  s += "\n> Next: confirm to build & deploy, or iterate on the idea.";
+  return s;
+}
+
+/**
+ * Hook:
+ * - Keeps per-idea generated files in-memory (filesByIdea)
+ * - Sends chat history to /mvp so OpenAI gets context
+ * - On /build, posts the saved files to /sandbox-deploy
+ */
 export function useSendHandler(args: Args) {
   const { ideas, activeIdea, updateIdea, messageEndRef, setLoading } = args;
 
+  // Per-idea files (what /mvp returned last)
+  const filesByIdea = React.useRef<Map<string, Record<string, string>>>(new Map());
+
   // Handles /build command (streams deploy logs + shows real URL)
   async function handleBuildCommand(threadId: string) {
-    let thread = (ideas.find((i) => i.id === threadId) ?? activeIdea).messages;
+    let thread = (ideas.find((i) => i.id === threadId) ?? activeIdea)?.messages ?? [];
 
     // Insert deploy placeholder
     const placeholder = { role: "assistant", content: "Starting build & deploy..." };
@@ -85,10 +125,13 @@ export function useSendHandler(args: Args) {
     scrollToEnd(messageEndRef);
 
     try {
-      // 🔒 Always call the API via /api/*
-      const resp = await post<{ ok: boolean; url?: string; name?: string; error?: string }>(
-        "/api/sandbox-deploy",
-        { confirm: true }
+      // Pull the files for this idea/thread
+      const files = filesByIdea.current.get(threadId);
+
+      // Kick off backend deploy
+      const resp = await postJSON<{ ok: boolean; url?: string; name?: string; error?: string }>(
+        "/sandbox-deploy",
+        { confirm: true, mode: "pages", files }
       );
 
       // Simulate streaming logs while deploy runs
@@ -107,12 +150,12 @@ export function useSendHandler(args: Args) {
       for (const line of lines) {
         accum += line + "\n";
         const current = accum + "```";
-        thread = (ideas.find((i) => i.id === threadId) ?? activeIdea).messages;
+        thread = (ideas.find((i) => i.id === threadId) ?? activeIdea)?.messages ?? [];
         const updated = [...thread];
         updated[updated.length - 1] = { role: "assistant", content: current };
         updateIdea(threadId, { messages: updated });
         scrollToEnd(messageEndRef);
-        await new Promise((r) => setTimeout(r, 300));
+        await new Promise((r) => setTimeout(r, 250));
       }
       accum += "```";
 
@@ -122,12 +165,12 @@ export function useSendHandler(args: Args) {
         "- App URL: " + liveUrl + "\n" +
         "- Repo: " + "(sandbox deploy)";
 
-      thread = (ideas.find((i) => i.id === threadId) ?? activeIdea).messages;
+      thread = (ideas.find((i) => i.id === threadId) ?? activeIdea)?.messages ?? [];
       const updated = [...thread];
       updated[updated.length - 1] = { role: "assistant", content: accum + summary };
       updateIdea(threadId, { messages: updated });
     } catch (err: any) {
-      thread = (ideas.find((i) => i.id === threadId) ?? activeIdea).messages;
+      thread = (ideas.find((i) => i.id === threadId) ?? activeIdea)?.messages ?? [];
       const updated = [...thread];
       const msg =
         "**Deploy failed:** " + (err?.message ? String(err.message) : String(err || "Unknown error"));
@@ -157,27 +200,45 @@ export function useSendHandler(args: Args) {
     scrollToEnd(messageEndRef);
 
     // 2) Placeholder assistant for streaming plan
-    let thread = (ideas.find((i) => i.id === id) ?? activeIdea).messages;
+    let thread = (ideas.find((i) => i.id === id) ?? activeIdea)?.messages ?? [];
     const placeholder = { role: "assistant", content: "" };
     updateIdea(id, { messages: [...thread, placeholder] });
     scrollToEnd(messageEndRef);
 
     try {
+      // Build compact history to send with /mvp
+      thread = (ideas.find((i) => i.id === id) ?? activeIdea)?.messages ?? [];
+      const history = serializeHistory(thread);
+
       type MvpResp = {
         ok: boolean;
-        result?: { ir: any; manifest: { files: string[] }; smoke: { passed: boolean; logs: string[] } };
+        result?: {
+          ir: any;
+          files?: Record<string, string>;
+          smoke: { passed: boolean; logs: string[] };
+        };
         error?: string;
       };
 
-      // 🔒 Always call through /api/*
-      const data = await post<MvpResp>("/api/mvp", { idea: content });
+      // Send the idea + thread history; backend will call OpenAI and return files
+      const data = await postJSON<MvpResp>("/mvp", {
+        idea: content,
+        thread: history,
+        ideaId: id
+      });
+
+      // Save files per idea for the /build step
+      if (data?.ok && data.result?.files) {
+        filesByIdea.current.set(id, data.result.files);
+      }
+
       const markdown = buildAssistantMarkdown(data);
 
-      // 3) Stream plan content
+      // 3) Stream plan content into placeholder
       await streamText(
         markdown,
         (partial) => {
-          thread = (ideas.find((i) => i.id === id) ?? activeIdea).messages;
+          thread = (ideas.find((i) => i.id === id) ?? activeIdea)?.messages ?? [];
           const updated = [...thread];
           updated[updated.length - 1] = { role: "assistant", content: partial };
           updateIdea(id, { messages: updated });
@@ -186,7 +247,7 @@ export function useSendHandler(args: Args) {
       );
 
       // 4) Add action buttons
-      thread = (ideas.find((i) => i.id === id) ?? activeIdea).messages;
+      thread = (ideas.find((i) => i.id === id) ?? activeIdea)?.messages ?? [];
       const withBtns = [...thread];
       const last = withBtns[withBtns.length - 1];
       withBtns[withBtns.length - 1] = withActions(last, [
@@ -195,7 +256,7 @@ export function useSendHandler(args: Args) {
       ]);
       updateIdea(id, { messages: withBtns });
     } catch (err: any) {
-      thread = (ideas.find((i) => i.id === id) ?? activeIdea).messages;
+      thread = (ideas.find((i) => i.id === id) ?? activeIdea)?.messages ?? [];
       const updated = [...thread];
       const msg =
         "**Request failed:** " + (err?.message ? String(err.message) : String(err || "Unknown error"));
@@ -207,5 +268,3 @@ export function useSendHandler(args: Args) {
     }
   };
 }
-
-export default useSendHandler;
