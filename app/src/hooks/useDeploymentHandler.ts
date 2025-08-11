@@ -1,5 +1,5 @@
 // app/src/hooks/useDeploymentHandler.ts
-// Deploys the stored bundle when the user clicks "Build & Deploy" and streams logs into chat.
+// Deploys the stored bundle when the user clicks "Build & Deploy" and streams logs + final URL.
 
 import { useCallback } from "react";
 import { postJSON } from "../lib/api";
@@ -12,99 +12,88 @@ type DeployResp = {
   logs?: string[];
 };
 
-type UseDeploymentHandlerOpts = {
-  ideas: any[];
-  updateIdea: (id: any, updates: any) => void;
-  setDeployLogs?: (logs: string[]) => void;
+type Idea = {
+  id: string;
+  messages: Array<{ role: "user" | "assistant"; content: string }>;
+  bundle?: Record<string, string>;
 };
 
-function useDeploymentHandler(opts: UseDeploymentHandlerOpts) {
-  const appendLog = (id: string, line: string) => {
-    opts.updateIdea(id, (prev: any) => {
-      const prevMsgs = Array.isArray(prev?.messages) ? prev.messages : [];
-      const msg = { role: "assistant" as const, content: line };
-      return { ...prev, messages: [...prevMsgs, msg] };
+export default function useDeploymentHandler(opts: {
+  ideas: Idea[];
+  updateIdea: (id: string, updates: Partial<Idea> | ((prev: any) => Partial<Idea>)) => void;
+  setDeployLogs?: (logs: string[]) => void;
+}) {
+  const { ideas, updateIdea, setDeployLogs } = opts;
+
+  const append = (id: string, line: string) => {
+    updateIdea(id, (prev: any) => {
+      const messages = Array.isArray(prev?.messages) ? prev.messages.slice() : [];
+      const last = messages[messages.length - 1];
+      if (last && last.role === "assistant") {
+        messages[messages.length - 1] = { ...last, content: (last.content || "") + `\n${line}` };
+      } else {
+        messages.push({ role: "assistant", content: line });
+      }
+      return { ...prev, messages };
     });
   };
 
   const deploy = useCallback(
-    async (args?: { id?: string }) => {
-      // Choose idea id: passed in or the last one with a bundle
-      let id = args?.id;
-      if (!id) {
-        const withBundle = opts.ideas.filter((i: any) => i?.bundle && Object.keys(i.bundle).length);
-        id = withBundle[withBundle.length - 1]?.id;
-      }
-      if (!id) throw new Error("Nothing to deploy—no generated bundle found.");
+    async (params?: { id?: string }) => {
+      const id = params?.id || ideas[ideas.length - 1]?.id;
+      const idea = ideas.find((i) => i.id === id);
+      if (!id || !idea) return;
 
-      // Read bundle from idea state
-      const idea = opts.ideas.find((i: any) => i.id === id);
-      const files: Record<string, string> | undefined = idea?.bundle;
+      const files = idea.bundle;
       if (!files || !Object.keys(files).length) {
-        throw new Error("Missing files for deploy.");
+        append(id, "❌ No build bundle available to deploy.");
+        return;
       }
 
-      // Show progress logs similar to your previous UI
+      // Preflight summary
+      const entries = Object.entries(files);
+      const totalBytes = entries.reduce((acc, [, c]) => acc + new TextEncoder().encode(String(c ?? "")).length, 0);
+      const fileCount = entries.length;
+      append(id, `🚀 Build & Deploy started (${fileCount} files, ~${Math.round(totalBytes / 1024)} KB)…`);
+
       const steps = [
-        "Packaging artifacts...",
-        "Generating repository files",
-        "Running typecheck",
-        "Building SPA",
-        "Bundling Worker",
-        "Running smoke tests",
-        "Uploading to Cloudflare",
-        "Activating new version",
-        "Deployment complete.",
+        "Packaging artifacts…",
+        "Generating repository files…",
+        "Running typecheck…",
+        "Building SPA…",
+        "Bundling Worker…",
+        "Running smoke tests…",
+        "Uploading to Cloudflare…",
+        "Activating new version…",
       ];
-      appendLog(id, steps[0]);
+      steps.forEach((s) => append(id, s));
 
       try {
-        // Send deploy request (confirm:true is required by the orchestrator)
         const res = await postJSON<DeployResp>("/api/sandbox-deploy", {
           id,
           files,
           confirm: true,
         });
 
-        // Append server-provided logs if present
         if (Array.isArray(res?.logs)) {
-          res.logs.forEach((l) => appendLog(id!, l));
-        } else {
-          // Otherwise, append our canned steps
-          steps.slice(1).forEach((l) => appendLog(id!, l));
+          res.logs.forEach((l) => append(id, l));
+          setDeployLogs?.(res.logs);
         }
 
         if (!res?.ok) {
-          appendLog(id, `❌ ${res?.error || "Sandbox deploy failed"}`);
-          throw new Error(res?.error || "Sandbox deploy failed");
+          append(id, `❌ Deployment failed. ${res?.error || ""}`.trim());
+          return;
         }
 
-        // Final success message
-        const summary = [
-          "✅ Deployed.",
-          res.url ? `• App URL: ${res.url}` : undefined,
-          res.repo ? `• Repo: ${res.repo}` : undefined,
-        ]
-          .filter(Boolean)
-          .join("\n");
-
-        appendLog(id, summary);
-
-        // Persist url/repo on the idea
-        opts.updateIdea(id, { deployedUrl: res.url, repoUrl: res.repo });
-
-        return res;
+        append(id, "✅ Deployment complete.");
+        if (res.url) append(id, `**App URL:** ${res.url}`);
+        if (res.repo) append(id, `**Repo:** ${res.repo}`);
       } catch (e: any) {
-        appendLog(id, `❌ ${e?.message || "Deployment error"}`);
-        throw e;
+        append(id, `❌ Deployment error: ${String(e?.message || e)}`);
       }
     },
-    [opts.ideas, opts.updateIdea]
+    [ideas, updateIdea, setDeployLogs]
   );
 
-  // Shape used by useChatStages (button calls this)
-  return (params?: { id?: string }) => deploy(params);
+  return deploy;
 }
-
-export default useDeploymentHandler;
-export { useDeploymentHandler };
