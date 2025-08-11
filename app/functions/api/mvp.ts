@@ -1,12 +1,16 @@
 // src/api/mvp.ts
-// Generate a per-idea plan (IR) + deployable file bundle via OpenAI Responses API.
-// Adds structured logs so you can tail from CI or the CF dashboard.
+// Normalize OpenAI output to a deployable (buildless) Pages bundle.
+// - Uses Responses API (chat completions) to get IR + files or artifacts
+// - If only `artifacts` are present (TS/TSX), synthesize minimal `files`:
+//     * index.html (plain HTML+JS)
+//     * _worker.js (proxy to orchestrator so /api/* works)
+// - Always returns { ok, result: { ir, files, smoke }, via: "openai-mvp-v1" }
 
 import { json } from "@utils/log";
 
 export interface Env {
   OPENAI_API_KEY?: string;
-  OPENAI_MODEL?: string; // optional override, default below
+  OPENAI_MODEL?: string;
 }
 
 type ChatMsg = { role: "system" | "user" | "assistant"; content: string };
@@ -14,25 +18,30 @@ type ChatMsg = { role: "system" | "user" | "assistant"; content: string };
 type MvpRequest = {
   idea?: string;
   ideaId?: string;
-  thread?: ChatMsg[]; // optional compact chat history from the UI
+  thread?: ChatMsg[];
+};
+
+type IR = {
+  name: string;
+  app_type: "spa_api" | "spa" | "api";
+  pages?: string[];
+  api_routes?: Array<{ method: string; path: string }>;
+  notes?: string;
+  features?: string[];
 };
 
 type MvpResult = {
-  ir: {
-    name: string;
-    app_type: "spa_api" | "spa" | "api";
-    pages?: string[];
-    api_routes?: Array<{ method: string; path: string }>;
-    notes?: string;
-  };
+  ir: IR;
   files: Record<string, string>;
+  // models sometimes return `artifacts` instead of `files`
+  artifacts?: Record<string, string>;
   smoke: { passed: boolean; logs: string[] };
 };
 
 const ORCH = "https://launchwing-orchestrator.promptpulse.workers.dev";
 
-// Plain JS worker (Pages Direct Upload won’t transpile TS)
-const INJECTED_WORKER_JS = `export default {
+// Buildless worker in plain JS for Pages Direct Upload.
+const PROXY_WORKER_JS = `export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     const ORCH = "${ORCH}";
@@ -58,12 +67,12 @@ const INJECTED_WORKER_JS = `export default {
     }
 
     if (isApi) {
-      const upstreamPath =
+      const path =
         url.pathname === "/api" ? "/" :
         url.pathname.startsWith("/api/") ? url.pathname.slice(4) :
         url.pathname;
 
-      const upstream = new URL(upstreamPath + url.search, ORCH);
+      const upstream = new URL(path + url.search, ORCH);
       const init = {
         method: req.method,
         headers: req.headers,
@@ -90,209 +99,210 @@ const INJECTED_WORKER_JS = `export default {
   }
 };`;
 
+// Minimal page that exercises /api/echo and /api/health so the app is "dynamic".
+function synthIndexHTML(ir: IR) {
+  const title = ir?.name || "LaunchWing App";
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(title)}</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; line-height: 1.4; }
+      input, button, textarea { font: inherit; padding: .5rem .6rem; }
+      .row { display: flex; gap: .5rem; align-items: center; }
+      .log { margin-top: 1rem; white-space: pre-wrap; background: #f6f6f9; padding: .75rem; border-radius: .5rem; }
+      a { color: inherit; }
+    </style>
+  </head>
+  <body>
+    <h1>${escapeHtml(title)}</h1>
+    <p>This sandbox hits <code>/api/health</code> and <code>/api/echo</code> via the app's <code>_worker.js</code> proxy.</p>
+
+    <div class="row">
+      <input id="msg" placeholder="Type a message..." value="hello" />
+      <button id="btnEcho">Echo</button>
+      <button id="btnHealth">Health</button>
+    </div>
+
+    <div class="log" id="log">Ready.</div>
+
+    <script>
+      const log = (t) => { document.getElementById('log').textContent = t; };
+
+      document.getElementById('btnEcho').onclick = async () => {
+        try {
+          log('POST /api/echo ...');
+          const msg = document.getElementById('msg').value || 'hello';
+          const r = await fetch('/api/echo', {
+            method: 'POST',
+            headers: {'content-type':'application/json'},
+            body: JSON.stringify({ message: msg })
+          });
+          log('Echo → ' + (await r.text()));
+        } catch (e) {
+          log('Echo error: ' + e);
+        }
+      };
+
+      document.getElementById('btnHealth').onclick = async () => {
+        try {
+          log('GET /api/health ...');
+          const r = await fetch('/api/health');
+          log('Health → ' + (await r.text()));
+        } catch (e) {
+          log('Health error: ' + e);
+        }
+      };
+    </script>
+  </body>
+</html>`;
+}
+
+function escapeHtml(s: string) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 export async function mvpHandler(req: Request, env: Env): Promise<Response> {
-  const t0 = Date.now();
   try {
     const body = (await req.json().catch(() => ({}))) as MvpRequest;
     const idea = (body?.idea || "").trim();
-    if (!idea) {
-      console.log(JSON.stringify({ evt: "mvp.reject", reason: "missing_idea" }));
-      return json({ ok: false, error: "Missing idea" }, 400);
-    }
+    if (!idea) return json({ ok: false, error: "Missing idea" }, 400);
 
-    const apiKey = env.OPENAI_API_KEY;
-    if (!apiKey) {
-      console.log(JSON.stringify({ evt: "mvp.reject", reason: "missing_openai_key" }));
+    if (!env.OPENAI_API_KEY) {
       return json({ ok: false, error: "Missing OPENAI_API_KEY" }, 500);
     }
-
     const model = env.OPENAI_MODEL || "gpt-4.1-mini";
 
-    // --- Output schema the model must follow ---
+    // Schema the model must return
     const schema = {
       type: "object",
       additionalProperties: false,
       properties: {
-        ir: {
-          type: "object",
-          additionalProperties: true,
-          properties: {
-            name: { type: "string" },
-            app_type: { type: "string", enum: ["spa_api", "spa", "api"] },
-            pages: { type: "array", items: { type: "string" } },
-            api_routes: {
-              type: "array",
-              items: {
-                type: "object",
-                additionalProperties: false,
-                properties: {
-                  method: { type: "string" },
-                  path: { type: "string" }
-                },
-                required: ["method", "path"]
-              }
-            },
-            notes: { type: "string" }
-          },
-          required: ["name", "app_type"]
-        },
-        files: {
-          type: "object",
-          additionalProperties: { type: "string" },
-          description:
-            "Map of file path → UTF-8 contents. Keep the bundle tiny and deployable on Cloudflare Pages Direct Upload (Advanced Mode). Prefer vanilla HTML/JS, inline assets, and zero build steps."
-        },
+        ir: { type: "object", additionalProperties: true },
+        files: { type: "object", additionalProperties: { type: "string" } },
+        artifacts: { type: "object", additionalProperties: { type: "string" } },
         smoke: {
           type: "object",
           additionalProperties: false,
           properties: {
             passed: { type: "boolean" },
-            logs: { type: "array", items: { type: "string" } }
+            logs: { type: "array", items: { type: "string" } },
           },
-          required: ["passed", "logs"]
-        }
+          required: ["passed", "logs"],
+        },
       },
-      required: ["ir", "files", "smoke"]
+      required: ["ir", "smoke"],
     };
 
-    // --- System / developer guidance for the model ---
+    // Compose input stream (system + provided thread + user)
     const sys = [
       "You are an expert product+full‑stack generator for Cloudflare Pages (Advanced Mode) apps.",
-      "Produce a minimal, production‑ready bundle that can be deployed via Cloudflare Pages Direct Upload.",
-      "Constraints:",
-      "- Avoid frameworks or build steps; output plain files (HTML, JS, CSS) and tiny server code only if necessary.",
-      "- Use relative API paths (e.g., `/api/mvp`, `/api/health`).",
-      "- If the app needs API, include routes handled via a Pages Advanced Mode Worker `_worker.js`, or assume a proxy will map `/api/*` to the orchestrator.",
-      "- Keep total bundle size small; inline assets where reasonable; no external package managers.",
-      "Quality bar:",
-      "- Code should run without modification after upload.",
-      "- Keep file paths stable and flat (e.g., `index.html`, `app.js`, `_worker.js`).",
-      "- Comment sparingly but clearly."
+      "Prefer buildless output: plain files (HTML, JS, CSS). Avoid frameworks/build steps.",
+      "If you emit TypeScript/TSX or complex folders, also include a minimal buildless variant in `files`.",
+      "Use relative API paths (`/api/*`).",
     ].join("\n");
 
-    const threadIntro = body?.ideaId ? `Idea ID: ${body.ideaId}\n` : "";
-    const userPrompt =
-      `${threadIntro}User idea:\n${idea}\n\n` +
-      "Return JSON ONLY that matches the provided schema. Keep the file bundle minimal but functional.";
-
     const input: ChatMsg[] = [{ role: "system", content: sys }];
-
-    if (Array.isArray(body?.thread) && body!.thread!.length) {
-      for (const m of body!.thread!) {
-        input.push({
-          role: m.role === "assistant" || m.role === "system" ? m.role : "user",
-          content: String(m.content || "")
-        });
+    if (Array.isArray(body?.thread) && body.thread.length) {
+      for (const m of body.thread) {
+        input.push({ role: m.role === "assistant" || m.role === "system" ? m.role : "user", content: String(m.content || "") });
       }
     }
-    input.push({ role: "user", content: userPrompt });
+    input.push({ role: "user", content: `Idea:\n${idea}\n\nReturn JSON ONLY matching the schema.` });
 
-    console.log(JSON.stringify({ evt: "mvp.openai.start", model, idea_len: idea.length }));
-
-    // --- Call OpenAI Responses API ---
+    // Responses API
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
-        authorization: `Bearer ${apiKey}`,
-        "content-type": "application/json"
+        authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        "content-type": "application/json",
       },
       body: JSON.stringify({
         model,
         input,
-        response_format: {
-          type: "json_schema",
-          json_schema: { name: "mvp_bundle", schema, strict: true }
-        },
+        response_format: { type: "json_schema", json_schema: { name: "mvp_bundle", schema, strict: true } },
         temperature: 0.3,
-        max_output_tokens: 3500
-      })
+        max_output_tokens: 3500,
+      }),
     });
 
-    const rawText = await r.text();
-    console.log(JSON.stringify({ evt: "mvp.openai.done", status: r.status, ms: Date.now() - t0, bytes: rawText.length }));
-
-    if (!r.ok) {
-      return json({ ok: false, error: `OpenAI HTTP ${r.status} — ${rawText}` }, 502);
-    }
+    const raw = await r.text();
+    if (!r.ok) return json({ ok: false, error: `OpenAI HTTP ${r.status} — ${raw}` }, 502);
 
     type Resp = {
       output_text?: string;
-      output?: Array<{
-        content?: Array<{ type: string; text?: { value?: string } }>;
-      }>;
+      output?: Array<{ content?: Array<{ type: string; text?: { value?: string } }> }>;
     };
-
-    let parsedResp: Resp;
+    let parsed: Resp;
     try {
-      parsedResp = JSON.parse(rawText) as Resp;
+      parsed = JSON.parse(raw) as Resp;
     } catch {
-      console.log(JSON.stringify({ evt: "mvp.parse.fail", reason: "not_json", ms: Date.now() - t0 }));
       return json({ ok: false, error: "Malformed JSON from OpenAI" }, 502);
     }
 
-    const jsonPayload =
-      parsedResp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text?.value ??
-      parsedResp.output_text ??
+    const payload =
+      parsed.output?.[0]?.content?.find((c) => c.type === "output_text")?.text?.value ??
+      parsed.output_text ??
       "";
 
-    if (!jsonPayload) {
-      console.log(JSON.stringify({ evt: "mvp.parse.fail", reason: "empty_payload", ms: Date.now() - t0 }));
-      return json({ ok: false, error: "Empty model output" }, 502);
-    }
+    if (!payload) return json({ ok: false, error: "Empty model output" }, 502);
 
     let result: MvpResult;
     try {
-      result = JSON.parse(jsonPayload) as MvpResult;
+      result = JSON.parse(payload) as any;
     } catch {
-      const m = jsonPayload.match(/\{[\s\S]*\}$/);
-      if (!m) {
-        console.log(JSON.stringify({ evt: "mvp.parse.fail", reason: "json_extract_failed", ms: Date.now() - t0 }));
-        return json({ ok: false, error: "Could not parse JSON from model output" }, 502);
-      }
-      result = JSON.parse(m[0]) as MvpResult;
+      const m = payload.match(/\{[\s\S]*\}$/);
+      if (!m) return json({ ok: false, error: "Could not parse JSON from model output" }, 502);
+      result = JSON.parse(m[0]) as any;
     }
 
-    // --- Guardrails on files (count/size) ---
+    // Guardrails + normalization
     result.ir ||= { name: "Generated App", app_type: "spa_api" } as any;
     result.files ||= {};
+    result.artifacts ||= {};
     result.smoke ||= { passed: true, logs: [] };
 
+    // If model returned only artifacts (TS/TSX etc.), synthesize buildless files
+    const needsSynthesis = Object.keys(result.files).length === 0 && Object.keys(result.artifacts).length > 0;
+    if (needsSynthesis) {
+      result.files["index.html"] = synthIndexHTML(result.ir);
+      result.smoke.logs.push("Synthesized buildless index.html from IR because only artifacts were provided.");
+    }
+
+    // Enforce limits + sanitize paths
     const MAX_FILES = 50;
-    const MAX_BYTES = 300_000; // ~300 KB of UTF‑8 text
+    const MAX_BYTES = 300_000;
     const enc = new TextEncoder();
     const outFiles: Record<string, string> = {};
     let total = 0;
     let n = 0;
 
-    for (const [path0, content0] of Object.entries(result.files)) {
+    for (const [p0, c0] of Object.entries(result.files)) {
       if (n >= MAX_FILES) break;
-      const path = String(path0 || "").replace(/^\/+/, "");
-      const content = String(content0 ?? "");
-      const sz = enc.encode(content).length;
+      const p = String(p0 || "").replace(/^\/+/, "");
+      const c = String(c0 ?? "");
+      const sz = enc.encode(c).length;
       if (total + sz > MAX_BYTES) break;
-      outFiles[path] = content;
+      outFiles[p] = c;
       total += sz;
       n++;
     }
 
-    // === Injection: ensure `_worker.js` exists for dynamic API proxy ===
-    const hasWorker =
-      Object.prototype.hasOwnProperty.call(outFiles, "_worker.js") ||
-      Object.prototype.hasOwnProperty.call(outFiles, "_worker.ts");
-
-    if (!hasWorker) {
-      outFiles["_worker.js"] = INJECTED_WORKER_JS;
-      result.smoke.logs.push("Injected _worker.js proxy → orchestrator");
-      console.log(JSON.stringify({ evt: "mvp.inject.worker", file: "_worker.js" }));
+    // Ensure `_worker.js` exists for dynamic API
+    if (!("_worker.js" in outFiles) && !("_worker.ts" in outFiles)) {
+      outFiles["_worker.js"] = PROXY_WORKER_JS;
+      result.smoke.logs.push("Injected _worker.js proxy → orchestrator.");
     }
 
     result.files = outFiles;
 
-    const ms = Date.now() - t0;
-    console.log(JSON.stringify({ evt: "mvp.success", ms, files: Object.keys(outFiles).length, bytes: total }));
-    return json({ ok: true, result, via: "openai-mvp-v1", via_detail: { ms } });
+    return json({ ok: true, result, via: "openai-mvp-v1" });
   } catch (err: any) {
-    console.log(JSON.stringify({ evt: "mvp.error", err: String(err?.message || err) }));
-    return json({ ok: false, error: String(err?.message || err || "unknown error") }, 500);
+    return json({ ok: false, error: String(err?.message || err) }, 500);
   }
 }
