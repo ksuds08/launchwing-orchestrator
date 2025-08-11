@@ -1,7 +1,6 @@
 // app/src/hooks/useSendHandler.ts
-// Generate via /api/mvp (OpenAI Responses API), store bundle, and SIMULATE a streaming
-// assistant message that includes plan + CODE PREVIEWS (truncated).
-// We DO NOT deploy here; Build & Deploy happens later.
+// Calls /api/mvp and SIMULATES streaming by overwriting the assistant message
+// using ONLY plain-object updates (no functional updates).
 
 import { useCallback, useRef } from "react";
 import { postJSON } from "../lib/api";
@@ -25,10 +24,8 @@ type MvpResp = {
     smoke?: { passed: boolean; logs: string[] };
   };
   error?: string;
-
-  // Proof fields from orchestrator
-  via?: string;          // "openai-mvp-v1"
-  model?: string;        // e.g., "gpt-4.1-mini"
+  via?: string;
+  model?: string;
   oai_request_id?: string | null;
   took_ms?: number;
 };
@@ -36,7 +33,7 @@ type MvpResp = {
 type UseSendHandlerOpts = {
   ideas: any[];
   activeIdea: any | null;
-  updateIdea: (id: any, updates: any) => void;
+  updateIdea: (id: string, updates: any) => void; // must accept plain objects
   handleAdvanceStage?: (...args: any[]) => void;
   handleConfirmBuild?: (...args: any[]) => void;
   messageEndRef?: React.RefObject<HTMLDivElement>;
@@ -64,10 +61,12 @@ function extToLang(path: string): string {
 }
 
 function previewOf(content: string): { text: string; truncated: boolean } {
-  const byBytes = new TextEncoder().encode(content).slice(0, MAX_PREVIEW_BYTES);
-  let text = new TextDecoder().decode(byBytes);
-  let truncated = byBytes.length < new TextEncoder().encode(content).length;
-  // also enforce line limit
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const bytes = enc.encode(content);
+  const sliced = bytes.slice(0, MAX_PREVIEW_BYTES);
+  let text = dec.decode(sliced);
+  let truncated = sliced.length < bytes.length;
   const lines = text.split(/\r?\n/);
   if (lines.length > MAX_PREVIEW_LINES) {
     text = lines.slice(0, MAX_PREVIEW_LINES).join("\n");
@@ -79,84 +78,54 @@ function previewOf(content: string): { text: string; truncated: boolean } {
 export function useSendHandler(opts: UseSendHandlerOpts) {
   const filesByIdea = useRef<Map<string, Record<string, string>>>(new Map());
 
-  // Append/replace last assistant message during "streaming"
-  const upsertAssistant = (id: string, fn: (prev: string) => string) => {
-    opts.updateIdea(id, (prev: any) => {
-      const messages: ChatMsg[] = Array.isArray(prev?.messages) ? prev.messages.slice() : [];
-      if (!messages.length || messages[messages.length - 1].role !== "assistant") {
-        messages.push({ role: "assistant", content: "" });
-      }
-      const last = messages[messages.length - 1];
-      messages[messages.length - 1] = { ...last, content: fn(String(last.content || "")) };
-      return { ...prev, messages };
-    });
-  };
-
-  const simulateStream = async (id: string, fullText: string, speedMs = 12) => {
-    let i = 0;
-    const stepSize = Math.min(25, Math.max(10, Math.floor(fullText.length / 120))); // scale with size
-    const tick = () => {
-      if (i >= fullText.length) return;
-      const next = fullText.slice(i, i + stepSize);
-      upsertAssistant(id, (prev) => prev + next);
-      i += stepSize;
-      // auto-scroll
-      if (opts.messageEndRef?.current) {
-        opts.messageEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
-      }
-      if (i < fullText.length) setTimeout(tick, speedMs);
-    };
-    // ensure bubble exists + empty it (replace placeholder)
-    upsertAssistant(id, () => "");
-    setTimeout(tick, speedMs);
-  };
-
   const handleSend = useCallback(
     async (text: string) => {
       const ideaText = String(text ?? "").trim();
-      if (!ideaText) return;
+      const active = opts.activeIdea;
+      if (!ideaText || !active?.id) return;
+      const id = active.id;
 
-      const id = opts.activeIdea?.id;
-      if (!id) throw new Error("No active idea");
+      // Snapshot prior messages (no functional updates)
+      const prior: ChatMsg[] = Array.isArray(active.messages) ? active.messages.slice() : [];
 
-      const prior = Array.isArray(opts.activeIdea?.messages) ? opts.activeIdea.messages : [];
-
-      // show user message + placeholder assistant
+      // 1) Show user message + placeholder
+      const baseMsgs: ChatMsg[] = [...prior, { role: "user", content: ideaText }];
       opts.setLoading?.(true);
-      opts.updateIdea(id, {
-        messages: [
-          ...prior,
-          { role: "user", content: ideaText },
-          { role: "assistant", content: "Generating plan and code…" },
-        ],
-      });
+      opts.updateIdea(id, { messages: [...baseMsgs, { role: "assistant", content: "Generating plan and code…" }] });
 
-      // Build thread for context
-      const thread: ChatMsg[] = [
-        ...prior.map((m: any) => ({ role: m.role, content: String(m.content ?? "") })),
-        { role: "user", content: ideaText },
-      ];
+      // Helper to overwrite last assistant bubble with full text
+      const renderAssistant = (full: string) => {
+        opts.updateIdea(id, { messages: [...baseMsgs, { role: "assistant", content: full }] });
+        if (opts.messageEndRef?.current) {
+          opts.messageEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
+        }
+      };
 
       try {
-        const data = await postJSON<MvpResp>("/api/mvp", { idea: ideaText, ideaId: id, thread });
+        // 2) Call orchestrator
+        const data = await postJSON<MvpResp>("/api/mvp", {
+          idea: ideaText,
+          ideaId: id,
+          thread: baseMsgs, // compact history
+        });
 
         if (!data?.ok) {
-          upsertAssistant(id, () => `❌ ${data?.error || "MVP generation failed"}`);
+          renderAssistant(`❌ ${data?.error || "MVP generation failed"}`);
           return;
         }
 
-        // Choose files map (files first, then artifacts)
+        // 3) Choose files map
         const bundle: Record<string, string> | undefined =
           (data?.result as any)?.files ??
           (data?.result as any)?.artifacts ??
           undefined;
 
-        if (!bundle || typeof bundle !== "object" || !Object.keys(bundle).length) {
-          upsertAssistant(id, () => "❌ No files returned from /api/mvp");
+        if (!bundle || !Object.keys(bundle).length) {
+          renderAssistant("❌ No files returned from /api/mvp");
           return;
         }
 
-        // Persist bundle + stage so UI can show Build & Deploy
+        // Stash bundle and stage (object updates only)
         filesByIdea.current.set(id, bundle);
         opts.updateIdea(id, {
           bundle,
@@ -164,7 +133,7 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
           currentStage: "build",
         });
 
-        // Build transcript with plan, proof, and CODE PREVIEWS
+        // 4) Build transcript (with code previews)
         const ir = data?.result?.ir || {};
         const logs = data?.result?.smoke?.logs || [];
         const model = data?.model || "unknown-model";
@@ -178,75 +147,73 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
 
         const ordered = fileEntries
           .map(([p, c]) => ({ path: p, content: String(c ?? ""), size: new TextEncoder().encode(String(c ?? "")).length }))
-          // prioritize index and worker first, then by size desc
           .sort((a, b) => {
-            const rank = (x: string) =>
-              x === "index.html" ? 0 : x === "_worker.js" ? 1 : 2;
+            const rank = (x: string) => (x === "index.html" ? 0 : x === "_worker.js" ? 1 : 2);
             const r = rank(a.path) - rank(b.path);
             return r !== 0 ? r : b.size - a.size;
           })
           .slice(0, MAX_FILES_PREVIEW);
 
-        const lines: string[] = [];
-        lines.push(`🤖 **OpenAI**${via}`);
-        lines.push(`- Model: \`${model}\``);
-        lines.push(`- Request ID: \`${reqId}\``);
-        lines.push(`- Latency: \`${took}\``);
-        lines.push("");
-        lines.push(`### Plan: ${ir?.name || "App"}`);
-        if (ir?.app_type) lines.push(`Type: \`${ir.app_type}\``);
-        if (ir?.features?.length) lines.push(`Features: ${ir.features.map((f) => `\`${f}\``).join(", ")}`);
-        if (ir?.pages?.length) lines.push(`Pages: ${ir.pages.map((p) => `\`${p}\``).join("  • ")}`);
+        const chunks: string[] = [];
+        const push = (s = "") => chunks.push(s);
+
+        push(`🤖 **OpenAI**${via}`);
+        push(`- Model: \`${model}\``);
+        push(`- Request ID: \`${reqId}\``);
+        push(`- Latency: \`${took}\``);
+        push("");
+        push(`### Plan: ${ir?.name || "App"}`);
+        if (ir?.app_type) push(`Type: \`${ir.app_type}\``);
+        if (ir?.features?.length) push(`Features: ${ir.features.map((f: string) => `\`${f}\``).join(", ")}`);
+        if (ir?.pages?.length) push(`Pages: ${ir.pages.map((p: string) => `\`${p}\``).join("  • ")}`);
         if (ir?.api_routes?.length) {
-          lines.push("API routes:");
-          for (const r of ir.api_routes) lines.push(`  - \`${r.method}\` \`${r.path}\``);
+          push("API routes:");
+          for (const r of ir.api_routes) push(`  - \`${r.method}\` \`${r.path}\``);
         }
         if (ir?.notes) {
-          lines.push("");
-          lines.push("Notes:");
-          lines.push(ir.notes);
+          push("");
+          push("Notes:");
+          push(ir.notes);
         }
-
         if (logs.length) {
-          lines.push("");
-          lines.push("Smoke logs:");
-          for (const l of logs) lines.push(`  - ${l}`);
+          push("");
+          push("Smoke logs:");
+          for (const l of logs) push(`  - ${l}`);
         }
-
-        lines.push("");
-        lines.push(`### Files Generated (${fileCount} files, ~${Math.round(totalBytes / 1024)} KB)`);
-        if (fileCount > ordered.length) {
-          lines.push(`Showing first ${ordered.length} files:`);
-        }
+        push("");
+        push(`### Files Generated (${fileCount} files, ~${Math.round(totalBytes / 1024)} KB)`);
+        if (fileCount > ordered.length) push(`Showing first ${ordered.length} files:`);
 
         for (const { path, content, size } of ordered) {
           const { text, truncated } = previewOf(content);
           const lang = extToLang(path);
-          lines.push(`#### \`${path}\` (${Math.round(size / 1024)} KB)`);
-          lines.push("```" + lang);
-          lines.push(text);
-          lines.push("```");
-          if (truncated) lines.push("_…truncated preview_");
-          lines.push("");
+          push(`#### \`${path}\` (${Math.round(size / 1024)} KB)`);
+          push("```" + lang);
+          push(text);
+          push("```");
+          if (truncated) push("_…truncated preview_");
+          push("");
         }
 
-        lines.push("✅ Code bundle is ready. Click **Build & Deploy** to ship it.");
+        push("✅ Code bundle is ready. Click **Build & Deploy** to ship it.");
 
-        const transcript = lines.join("\n");
+        const transcript = chunks.join("\n");
 
-        // Replace placeholder with streaming transcript
-        opts.updateIdea(id, (prev: any) => {
-          const messages = prev.messages.slice();
-          const lastIdx = messages.length - 1;
-          if (lastIdx >= 0 && messages[lastIdx].role === "assistant") {
-            messages[lastIdx] = { ...messages[lastIdx], content: "" };
-          }
-          return { ...prev, messages };
-        });
-
-        await simulateStream(id, transcript, 10);
+        // 5) Simulated streaming: repeatedly overwrite assistant bubble
+        let i = 0;
+        const step = Math.min(25, Math.max(10, Math.floor(transcript.length / 120)));
+        const tick = () => {
+          if (i >= transcript.length) return;
+          const next = transcript.slice(0, i + step);
+          renderAssistant(next);
+          i += step;
+          setTimeout(tick, 10);
+        };
+        // Seed empty assistant before streaming
+        renderAssistant("");
+        setTimeout(tick, 10);
       } catch (e: any) {
-        upsertAssistant(id, () => `❌ ${e?.message || "Failed to generate MVP"}`);
+        renderAssistant(`❌ ${e?.message || "Failed to generate MVP"}`);
       } finally {
         opts.setLoading?.(false);
       }
