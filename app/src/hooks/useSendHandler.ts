@@ -2,7 +2,7 @@
 // Returns a callable send handler that:
 //  1) Appends the user's message to the active idea
 //  2) Calls /api/mvp to generate files
-//  3) Calls /api/sandbox-deploy to deploy
+//  3) Calls /api/sandbox-deploy with confirm:true to deploy
 //  4) Replaces the placeholder assistant message with a result summary
 // Accepts either `files` or `artifacts` from the API.
 
@@ -66,8 +66,12 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
       // Stash bundle for this idea
       filesByIdea.current.set(id, bundle as Record<string, string>);
 
-      // 2) Deploy to sandbox
-      const deploy = await postJSON<DeployResp>("/api/sandbox-deploy", { id, files: bundle });
+      // 2) Deploy to sandbox — include confirm:true for endpoints that require it
+      const deploy = await postJSON<DeployResp>("/api/sandbox-deploy", {
+        id,
+        files: bundle,
+        confirm: true,
+      });
       if (!deploy?.ok) throw new Error(deploy?.error || "Sandbox deploy failed");
 
       return {
