@@ -3,6 +3,7 @@ name: Deploy Orchestrator to Cloudflare Workers
 on:
   push:
     branches: ["main"]
+  workflow_dispatch: {}
 
 jobs:
   deploy:
@@ -10,7 +11,6 @@ jobs:
     permissions:
       contents: read
     env:
-      # Keep npm from failing on peer-dep noise
       NPM_CONFIG_LEGACY_PEER_DEPS: "true"
 
     steps:
@@ -20,53 +20,55 @@ jobs:
         with:
           node-version: "22"
 
-      # Install root + workspaces (use install instead of ci due to fresh lock)
       - name: Install deps
         run: npm install --no-audit --no-fund
 
-      # Build the SPA and copy to /public (root script drives the app workspace)
       - name: Build SPA → public/
         run: npm run build
 
       - name: Typecheck
         run: npm run typecheck
 
-      # Lint is non-blocking for now
       - name: Lint (non-blocking)
         run: npm run lint || true
 
-      # -------- Inject Cloudflare secrets into the Worker BEFORE deploy --------
-      # We deploy the orchestrator Worker with an API token, but at runtime the
-      # Worker itself will call the Services API using Global API Key + Email
-      # (preferred) or fall back to API Token if the key isn't present.
-      - name: Set Worker Secrets (account+token)
+      # -------- Inject CF token + account id (used by wrangler-action and as runtime fallback) --------
+      - name: Set Worker Secrets (token + account)
         env:
-          CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_API_TOKEN:   ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID:  ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           npx --yes wrangler@4.28.1 --version
-          yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator || true
-          yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator || true
-          printf "%s" "$CLOUDFLARE_API_TOKEN"  | npx wrangler@4.28.1 secret put CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator
-          printf "%s" "$CLOUDFLARE_ACCOUNT_ID" | npx wrangler@4.28.1 secret put CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator
+          if [ -n "${CF_API_TOKEN}" ]; then
+            yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator || true
+            printf "%s" "$CF_API_TOKEN" | npx wrangler@4.28.1 secret put CLOUDFLARE_API_TOKEN --name launchwing-orchestrator
+          fi
+          if [ -n "${CF_ACCOUNT_ID}" ]; then
+            yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator || true
+            printf "%s" "$CF_ACCOUNT_ID" | npx wrangler@4.28.1 secret put CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator
+          fi
 
-      - name: Set Worker Secrets (Global API Key auth for Services API)
-        if: ${{ secrets.CLOUDFLARE_EMAIL != '' && secrets.CLOUDFLARE_API_KEY != '' }}
+      # -------- Inject CF Global API Key + Email (preferred auth at runtime for Services API) --------
+      - name: Set Worker Secrets (global key + email)
         env:
-          CLOUDFLARE_EMAIL:   ${{ secrets.CLOUDFLARE_EMAIL }}
-          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CF_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+          CF_KEY:   ${{ secrets.CLOUDFLARE_API_KEY }}
         run: |
           npx --yes wrangler@4.28.1 --version
-          yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_EMAIL   --name launchwing-orchestrator || true
-          yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_API_KEY --name launchwing-orchestrator || true
-          printf "%s" "$CLOUDFLARE_EMAIL"   | npx wrangler@4.28.1 secret put CLOUDFLARE_EMAIL   --name launchwing-orchestrator
-          printf "%s" "$CLOUDFLARE_API_KEY" | npx wrangler@4.28.1 secret put CLOUDFLARE_API_KEY --name launchwing-orchestrator
+          if [ -n "${CF_EMAIL}" ] && [ -n "${CF_KEY}" ]; then
+            yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_EMAIL   --name launchwing-orchestrator || true
+            yes | npx wrangler@4.28.1 secret delete CLOUDFLARE_API_KEY --name launchwing-orchestrator || true
+            printf "%s" "$CF_EMAIL" | npx wrangler@4.28.1 secret put CLOUDFLARE_EMAIL   --name launchwing-orchestrator
+            printf "%s" "$CF_KEY"   | npx wrangler@4.28.1 secret put CLOUDFLARE_API_KEY --name launchwing-orchestrator
+          else
+            echo "⚠️ CLOUDFLARE_EMAIL or CLOUDFLARE_API_KEY not set; runtime will fall back to API token."
+          fi
 
       # ------------------------------- Deploy ---------------------------------
       - name: Deploy (wrangler)
         uses: cloudflare/wrangler-action@v3
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          apiToken:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: "4.28.1"
           command: deploy
