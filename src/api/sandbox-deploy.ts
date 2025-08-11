@@ -1,31 +1,26 @@
 // src/api/sandbox-deploy.ts
 // Dual-mode sandbox deploy:
 // - mode=pages: Direct Upload to Cloudflare Pages (Advanced Mode via _worker.js)
-// - mode=workers: Publish Worker; if workers.dev disabled, auto-fallback to pages
+// - mode=workers: Publish Worker; if workers.dev disabled/unavailable, auto-fallback to pages
 //
 // Requires account-level API token with scopes:
-//  - Account.Cloudflare Pages: Read/Write
-//  - Workers Scripts: Read/Write (if using mode=workers)
-//  - (If you later add DNS/Routes, include Zone DNS & Workers Routes)
+//  - Account.Cloudflare Pages: Edit
+//  - Account.Workers Scripts: Edit
 //
 import { json } from "@utils/log";
 
 export interface Env {
   CLOUDFLARE_API_TOKEN?: string;
   CLOUDFLARE_ACCOUNT_ID?: string;
-
-  // Orchestrator origin that Pages worker will proxy to:
-  ORCHESTRATOR_URL?: string; // e.g. https://launchwing-orchestrator.promptpulse.workers.dev
-
-  // Optional default deploy mode: "pages" | "workers"
-  DEFAULT_DEPLOY_MODE?: string;
+  ORCHESTRATOR_URL?: string;          // e.g. https://launchwing-orchestrator.promptpulse.workers.dev
+  DEFAULT_DEPLOY_MODE?: string;        // "pages" | "workers"
 }
 
 type DeployRequest = {
   confirm?: boolean;
   mode?: "pages" | "workers";
-  name?: string;              // optional explicit name
-  ideaId?: string;            // optional correlation id
+  name?: string;
+  ideaId?: string;
 };
 
 type DeployResult = {
@@ -50,7 +45,7 @@ function requireAccount(env: Env) {
   return id;
 }
 
-async function cfJSON<T>(env: Env, url: string, init?: RequestInit): Promise<T> {
+async function cfJSON(env: Env, url: string, init?: RequestInit): Promise<any> {
   const r = await fetch(url, {
     ...init,
     headers: {
@@ -66,13 +61,12 @@ async function cfJSON<T>(env: Env, url: string, init?: RequestInit): Promise<T> 
     const msg = data?.errors?.[0]?.message || data?.message || `HTTP ${r.status}`;
     throw new Error(`${msg} — ${url}`);
   }
-  return (data?.result ?? data ?? {}) as T;
+  return data?.result ?? data ?? {};
 }
 
 /**
- * Direct Upload to Cloudflare Pages:
- * - Create project if missing
- * - Deploy a minimal SPA + _worker.js that proxies /api/* to orchestrator
+ * Deploy a tiny SPA to Cloudflare Pages via Direct Upload with an Advanced Mode worker.
+ * Returns the live URL.
  */
 async function deployPagesDirect(env: Env, name: string): Promise<{ url: string }> {
   const account = requireAccount(env);
@@ -85,21 +79,20 @@ async function deployPagesDirect(env: Env, name: string): Promise<{ url: string 
         name,
         production_branch: "main",
         build_config: {
-          build_command: "", // direct upload (no build)
-          destination_dir: "/", // we'll upload files directly
+          build_command: "",
+          destination_dir: "/",
         },
       }),
     });
   } catch (e: any) {
-    // If it already exists, ignore "name already exists" style errors
     if (!/already exists|exists/i.test(String(e?.message || e))) {
       throw e;
     }
   }
 
-  // 2) Prepare a tiny SPA + Advanced Mode worker
-  const ORCH = env.ORCHESTRATOR_URL ||
-    "https://launchwing-orchestrator.promptpulse.workers.dev";
+  // 2) Minimal SPA + Advanced Mode worker that proxies /api/* back to orchestrator
+  const ORCH =
+    env.ORCHESTRATOR_URL || "https://launchwing-orchestrator.promptpulse.workers.dev";
 
   const indexHtml = `<!doctype html>
 <html>
@@ -185,26 +178,21 @@ export default {
   },
 };`;
 
-  // 3) Direct Upload deployment (multipart form-data with manifest + files)
-  // manifest maps relative file paths -> { size, etag? } (size is enough)
+  // 3) Direct Upload (multipart form-data: manifest + files)
   const files: Record<string, string> = {
     "index.html": indexHtml,
     "_worker.js": workerJs,
   };
 
-  // Build multipart payload
   const boundary = "----lwpages" + Math.random().toString(36).slice(2);
   const parts: Uint8Array[] = [];
   const enc = new TextEncoder();
 
   function push(s: string) { parts.push(enc.encode(s)); }
 
-  // manifest
   const manifest = {
     files: Object.fromEntries(
-      Object.entries(files).map(([path, content]) => [
-        path, { size: new Blob([content]).size }
-      ])
+      Object.entries(files).map(([path, content]) => [path, { size: new Blob([content]).size }])
     ),
   };
 
@@ -213,7 +201,6 @@ export default {
   push(`Content-Type: application/json\r\n\r\n`);
   push(JSON.stringify(manifest) + "\r\n");
 
-  // files
   for (const [path, content] of Object.entries(files)) {
     push(`--${boundary}\r\n`);
     push(`Content-Disposition: form-data; name="${path}"; filename="${path}"\r\n`);
@@ -225,59 +212,54 @@ export default {
 
   const body = new Blob(parts, { type: `multipart/form-data; boundary=${boundary}` });
 
-  const dep = await fetch(`${CF_API}/accounts/${account}/pages/projects/${encodeURIComponent(name)}/deployments`, {
-    method: "POST",
-    headers: {
-      ...bearer(env),
-      // DO NOT set content-type explicitly; fetch will set with boundary for Blob
-    },
-    body,
-  });
+  const dep = await fetch(
+    `${CF_API}/accounts/${account}/pages/projects/${encodeURIComponent(name)}/deployments`,
+    {
+      method: "POST",
+      headers: {
+        ...bearer(env),
+        // Do not set content-type manually for Blob; fetch sets boundary.
+      },
+      body,
+    }
+  );
+
   const depText = await dep.text();
-  if (!dep.ok) {
-    throw new Error(`Pages deploy failed: HTTP ${dep.status} — ${depText}`);
-  }
+  if (!dep.ok) throw new Error(`Pages deploy failed: HTTP ${dep.status} — ${depText}`);
+
   let depJson: any = {};
   try { depJson = depText ? JSON.parse(depText) : {}; } catch { /* noop */ }
+
   const result = depJson?.result || depJson;
-  const domains: string[] = result?.deployment_trigger?.metadata?.preview_urls
-    || result?.aliases
-    || result?.domains
-    || [];
-  const primary = result?.url || result?.domains?.[0] || domains[0];
-  if (!primary) {
-    // Fallback to canonical *.pages.dev
-    return { url: `https://${name}.pages.dev` };
-  }
-  const url = /^https?:\/\//i.test(primary) ? primary : `https://${primary}`;
+  const primary = result?.url || result?.domains?.[0];
+  const url = primary
+    ? (/^https?:\/\//i.test(primary) ? primary : `https://${primary}`)
+    : `https://${name}.pages.dev`;
+
   return { url };
 }
 
-/** (Optional) Workers script deploy — no workers_dev toggle here */
+/** Minimal Workers script upload (no workers.dev toggle here) */
 async function deployWorker(env: Env, name: string): Promise<{ url?: string }> {
-  // NOTE: If you want a workers.dev URL, you must have claimed a subdomain at the account level.
-  // This helper intentionally does NOT PATCH workers_dev to avoid the disabled/ignored setting.
-  // You can add routes later if you want a custom domain.
   const account = requireAccount(env);
+  const code = `export default { fetch() { return new Response("OK: ${name}", {status: 200}); } };`;
 
-  // Create/update script (simple stub that serves 200 OK)
-  const code = `export default { fetch(req) { return new Response("OK: ${name}", {status: 200}); } };`;
-
-  // Upload script
-  const r = await fetch(`${CF_API}/accounts/${account}/workers/scripts/${encodeURIComponent(name)}`, {
-    method: "PUT",
-    headers: {
-      "content-type": "application/javascript",
-      ...bearer(env),
-    },
-    body: code,
-  });
+  const r = await fetch(
+    `${CF_API}/accounts/${account}/workers/scripts/${encodeURIComponent(name)}`,
+    {
+      method: "PUT",
+      headers: {
+        "content-type": "application/javascript",
+        ...bearer(env),
+      },
+      body: code,
+    }
+  );
   if (!r.ok) {
     const t = await r.text();
     throw new Error(`Worker upload failed: HTTP ${r.status} — ${t}`);
   }
-
-  // No URL guaranteed without routes or workers.dev; return name only.
+  // No URL guaranteed without routes or workers.dev
   return { url: undefined };
 }
 
@@ -290,33 +272,32 @@ export async function sandboxDeployHandler(req: Request, env: Env): Promise<Resp
   try {
     const payload = (await req.json().catch(() => ({}))) as DeployRequest;
     if (!payload?.confirm) {
-      return json<DeployResult>({ ok: false, error: "confirm=false" }, 400);
+      const res: DeployResult = { ok: false, error: "confirm=false" };
+      return json(res, 400);
     }
 
-    const desiredMode = (payload.mode || env.DEFAULT_DEPLOY_MODE || "pages") as "pages" | "workers";
-    const name = (payload.name || pickName("lw-sbx")).toLowerCase().replace(/[^a-z0-9\-]/g, "-");
+    const desired = (payload.mode || env.DEFAULT_DEPLOY_MODE || "pages") as "pages" | "workers";
+    const name = (payload.name || pickName("lw-sbx"))
+      .toLowerCase()
+      .replace(/[^a-z0-9\-]/g, "-");
 
-    if (desiredMode === "workers") {
+    if (desired === "workers") {
       try {
         const w = await deployWorker(env, name);
-        // If you need a URL, recommend Pages fallback here
         if (!w.url) {
-          // Auto-fallback to Pages so we always return something usable
+          // No URL → auto-fallback to Pages for a usable preview
           const p = await deployPagesDirect(env, name);
-          return json<DeployResult>({ ok: true, name, url: p.url, fallback: "pages" });
+          const res: DeployResult = { ok: true, name, url: p.url, fallback: "pages" };
+          return json(res);
         }
-        return json<DeployResult>({ ok: true, name, url: w.url });
+        const res: DeployResult = { ok: true, name, url: w.url };
+        return json(res);
       } catch (e: any) {
-        // If failure looks like workers.dev disabled, fall back to Pages
         const msg = String(e?.message || e);
         if (/workers\.dev.*disabled|workers_dev/i.test(msg)) {
           const p = await deployPagesDirect(env, name);
-          return json<DeployResult>({
-            ok: true,
-            name,
-            url: p.url,
-            fallback: "pages",
-          });
+          const res: DeployResult = { ok: true, name, url: p.url, fallback: "pages" };
+          return json(res);
         }
         throw e;
       }
@@ -324,14 +305,10 @@ export async function sandboxDeployHandler(req: Request, env: Env): Promise<Resp
 
     // Default path: Pages (Advanced Mode)
     const p = await deployPagesDirect(env, name);
-    return json<DeployResult>({ ok: true, name, url: p.url });
+    const res: DeployResult = { ok: true, name, url: p.url };
+    return json(res);
   } catch (err: any) {
-    return json<DeployResult>(
-      {
-        ok: false,
-        error: String(err?.message || err || "unknown error"),
-      },
-      500
-    );
+    const res: DeployResult = { ok: false, error: String(err?.message || err || "unknown error") };
+    return json(res, 500);
   }
 }
