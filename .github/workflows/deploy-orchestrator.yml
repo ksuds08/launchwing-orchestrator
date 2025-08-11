@@ -35,7 +35,7 @@ jobs:
         with:
           node-version: 20
 
-      # ---- Robust install: ci if lockfile exists, otherwise install ----
+      # Robust install: ci if lockfile exists, else install
       - name: Install dependencies
         shell: bash
         run: |
@@ -54,7 +54,7 @@ jobs:
       - name: Wrangler version
         run: npx --yes wrangler@4.28.1 --version
 
-      # --- Required Worker secrets only (PUT-only; no deletes to avoid versions race) ---
+      # --- Required Worker secrets only (PUT-only; avoid versions race) ---
       - name: Set Worker secrets
         shell: bash
         run: |
@@ -70,12 +70,12 @@ jobs:
             echo "❌ OPENAI_API_KEY GitHub secret is missing"; exit 1
           fi
 
-          printf "%s" "$CLOUDFLARE_API_TOKEN"  | npx wrangler@4.28.1 secret put CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator --quiet
-          printf "%s" "$CLOUDFLARE_ACCOUNT_ID" | npx wrangler@4.28.1 secret put CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator --quiet
-          printf "%s" "$OPENAI_API_KEY"        | npx wrangler@4.28.1 secret put OPENAI_API_KEY        --name launchwing-orchestrator --quiet
+          printf "%s" "$CLOUDFLARE_API_TOKEN"  | npx wrangler@4.28.1 secret put CLOUDFLARE_API_TOKEN  --name launchwing-orchestrator
+          printf "%s" "$CLOUDFLARE_ACCOUNT_ID" | npx wrangler@4.28.1 secret put CLOUDFLARE_ACCOUNT_ID --name launchwing-orchestrator
+          printf "%s" "$OPENAI_API_KEY"        | npx wrangler@4.28.1 secret put OPENAI_API_KEY        --name launchwing-orchestrator
 
           if [ -n "${OPENAI_MODEL:-}" ]; then
-            printf "%s" "$OPENAI_MODEL" | npx wrangler@4.28.1 secret put OPENAI_MODEL --name launchwing-orchestrator --quiet
+            printf "%s" "$OPENAI_MODEL" | npx wrangler@4.28.1 secret put OPENAI_MODEL --name launchwing-orchestrator
           fi
 
       - name: Deploy Worker
