@@ -125,8 +125,11 @@ async function deployPagesDirect(env: Env, name: string): Promise<{ url: string 
   </body>
 </html>`;
 
-  const workerJs = `// Pages Advanced Mode proxy to orchestrator
+  // NOTE: this worker includes an INLINE index fallback to avoid 404s immediately after deploy
+  const workerJs = `// Pages Advanced Mode proxy to orchestrator with inline index fallback
 const ORCH = ${JSON.stringify(ORCH)};
+const INLINE_INDEX = ${JSON.stringify(indexHtml)};
+
 function corsHeaders(req) {
   const reqHdrs = req?.headers?.get("Access-Control-Request-Headers");
   return {
@@ -158,24 +161,50 @@ function upstreamPath(path) {
   }
   return "/";
 }
+
+async function serveIndexInline() {
+  return new Response(INLINE_INDEX, {
+    status: 200,
+    headers: { "content-type": "text/html; charset=utf-8" }
+  });
+}
+
 async function serveSPA(req, env) {
-  const exact = await env.ASSETS.fetch(req);
-  if (exact.status !== 404) return exact;
+  const url = new URL(req.url);
+  const path = url.pathname;
+
+  // Inline fast paths
+  if (path === "/" || path === "/index.html") {
+    return serveIndexInline();
+  }
+
+  // Try exact asset
+  const exact = await env.ASSETS.fetch(req).catch(() => new Response(null, { status: 404 }));
+  if (exact && exact.status !== 404) return exact;
+
+  // SPA fallback to /index.html if HTML requested
   const accepts = req.headers.get("accept") || "";
   const isGetLike = req.method === "GET" || req.method === "HEAD";
   if (isGetLike && accepts.includes("text/html")) {
-    const url = new URL(req.url);
+    // Try asset /index.html first…
     const indexReq = new Request(new URL("/index.html", url), req);
-    const indexRes = await env.ASSETS.fetch(indexReq);
-    if (indexRes.status !== 404) return indexRes;
+    const indexRes = await env.ASSETS.fetch(indexReq).catch(() => new Response(null, { status: 404 }));
+    if (indexRes && indexRes.status !== 404) return indexRes;
+
+    // …then inline fallback
+    return serveIndexInline();
   }
-  return exact;
+
+  return new Response("Not found", { status: 404 });
 }
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
+
+    if (req.method === "OPTIONS") return preflight(req);
+
     if (isApiLike(url.pathname)) {
-      if (req.method === "OPTIONS") return preflight(req);
       const upstream = new URL(upstreamPath(url.pathname), ORCH);
       upstream.search = url.search;
       const init = {
@@ -190,6 +219,7 @@ export default {
       for (const k in c) h.set(k, c[k]);
       return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
     }
+
     return serveSPA(req, env);
   },
 };`;
