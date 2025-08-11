@@ -16,10 +16,14 @@ type ExportResp = {
   error?: string;
 };
 
-export function useDeploymentHandler() {
+/**
+ * Hook that wraps orchestrator deploy/export endpoints.
+ * Keeps the API small and stable for callers like useChatStages().
+ */
+function useDeploymentHandler() {
   /**
    * Deploys a files bundle to the sandbox (Cloudflare Pages via orchestrator).
-   * Expects the orchestrator /sandbox-deploy endpoint to return { ok, url?, repo? }.
+   * Maps to /api/sandbox-deploy (proxied by Pages worker).
    */
   const deploy = useCallback(
     async (args: { id: string; files: Record<string, string> }) => {
@@ -32,7 +36,7 @@ export function useDeploymentHandler() {
 
   /**
    * Exports the files bundle to GitHub (optional repoName).
-   * Maps to orchestrator /github-export.
+   * Maps to /api/github-export (proxied by Pages worker).
    */
   const exportRepo = useCallback(
     async (args: { id: string; files: Record<string, string>; repoName?: string }) => {
@@ -45,3 +49,6 @@ export function useDeploymentHandler() {
 
   return { deploy, exportRepo };
 }
+
+export default useDeploymentHandler;
+export { useDeploymentHandler };
