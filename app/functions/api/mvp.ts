@@ -1,7 +1,8 @@
 // src/api/mvp.ts
 // Require the model to return a buildless `files` bundle (HTML/JS/CSS/_worker.js).
 // If it doesn't, we 502 with a clear error so the UI won't silently show nothing.
-// We also return proof fields: via, model, oai_request_id, took_ms.
+// Returns proof fields: via, model, oai_request_id, took_ms.
+// NEW: if the request has ?debug=1, include debug_raw_openai + debug_payload in the response.
 
 import { json } from "@utils/log";
 
@@ -36,6 +37,9 @@ type MvpResult = {
 export async function mvpHandler(req: Request, env: Env): Promise<Response> {
   const t0 = Date.now();
   try {
+    const url = new URL(req.url);
+    const debug = url.searchParams.get("debug") === "1";
+
     const body = (await req.json().catch(() => ({}))) as MvpRequest;
     const idea = (body?.idea || "").trim();
     if (!idea) return json({ ok: false, error: "Missing idea" }, 400);
@@ -90,7 +94,6 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
       required: ["ir", "files", "smoke"],
     };
 
-    // hard guidance to the model
     const sys = [
       "You are an expert generator for Cloudflare Pages (Advanced Mode).",
       "Return a SMALL, DEPLOYABLE bundle in `files` ONLY (no `artifacts`).",
@@ -208,7 +211,7 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
       n++;
     }
 
-    // Ensure we have a worker if API routes indicated
+    // Ensure a minimal worker if API is implied
     const needsApi =
       (result.ir.api_routes && result.ir.api_routes.length > 0) ||
       Object.keys(out).some((k) => k.toLowerCase() === "_worker.js");
@@ -238,6 +241,7 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
       model,
       oai_request_id,
       took_ms,
+      ...(debug ? { debug_raw_openai: raw, debug_payload: payload } : {}),
     });
   } catch (err: any) {
     return json({ ok: false, error: String(err?.message || err) }, 500);
