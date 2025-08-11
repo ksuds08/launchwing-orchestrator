@@ -25,7 +25,67 @@ jobs:
       - name: Build SPA → app/dist
         run: npm run -w app build
 
-      # Idempotent: won't fail if the project already exists
+      # 🔧 Inject Pages Advanced Mode worker that proxies /api/* to orchestrator
+      - name: Write _worker.ts (Pages Advanced proxy)
+        run: |
+          cat > app/dist/_worker.ts <<'TS'
+          export interface Env {
+            ASSETS: Fetcher; // auto-bound by Pages
+          }
+
+          const ORCH = "https://launchwing-orchestrator.promptpulse.workers.dev";
+
+          async function serveSPA(req: Request, env: Env) {
+            // try the exact asset first
+            const res = await env.ASSETS.fetch(req);
+            if (res.status !== 404) return res;
+
+            // SPA fallback to /index.html for GET/HEAD + HTML
+            const accepts = req.headers.get("accept") || "";
+            const isGetLike = req.method === "GET" || req.method === "HEAD";
+            if (isGetLike && accepts.includes("text/html")) {
+              const url = new URL(req.url);
+              const indexReq = new Request(new URL("/index.html", url), req);
+              const indexRes = await env.ASSETS.fetch(indexReq);
+              if (indexRes.status !== 404) return indexRes;
+            }
+
+            return res;
+          }
+
+          export default {
+            async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+              const url = new URL(req.url);
+
+              // Proxy /api/* to orchestrator Worker
+              if (url.pathname.startsWith("/api/")) {
+                const upstream = new URL(url.pathname.replace(/^\/api/, ""), ORCH);
+                upstream.search = url.search;
+
+                const init: RequestInit = {
+                  method: req.method,
+                  headers: new Headers(req.headers),
+                };
+                // pass through body for non-GET/HEAD
+                if (req.method !== "GET" && req.method !== "HEAD") {
+                  init.body = await req.arrayBuffer();
+                }
+
+                const r = await fetch(upstream.toString(), init);
+                // stream back as-is
+                return new Response(r.body, {
+                  status: r.status,
+                  headers: r.headers,
+                });
+              }
+
+              // Otherwise serve SPA/assets
+              return serveSPA(req, env);
+            },
+          } satisfies ExportedHandler<Env>;
+          TS
+
+      # Idempotent project creation
       - name: Create Pages project if missing
         continue-on-error: true
         uses: cloudflare/wrangler-action@v3
@@ -38,8 +98,8 @@ jobs:
             --production-branch main
             --compatibility-date 2024-11-01
 
-      # Deploy static build + Pages Functions under app/functions
-      - name: Publish to Pages
+      # Deploy (Pages auto-detects _worker.ts and switches to Advanced Mode)
+      - name: Publish to Pages (Advanced Mode)
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
