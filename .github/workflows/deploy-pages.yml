@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NPM_CONFIG_LEGACY_PEER_DEPS: "true"
-      CF_PAGES_PROJECT: "launchwing-app"   # pick once and keep
+      CF_PAGES_PROJECT: "launchwing-app"
 
     steps:
       - uses: actions/checkout@v4
@@ -25,14 +25,14 @@ jobs:
       - name: Build SPA → app/dist
         run: npm run -w app build
 
-      # Ensure the Pages project exists (idempotent)
+      # Create the Pages project if it doesn't exist (no --yes)
       - name: Create Pages project if missing
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: "4"
-          command: pages project create ${{ env.CF_PAGES_PROJECT }} --production-branch main --compatibility-date 2024-11-01 --yes
+          command: pages project create ${{ env.CF_PAGES_PROJECT }} --production-branch main --compatibility-date 2024-11-01
 
       # Deploy the built directory
       - name: Publish to Pages
