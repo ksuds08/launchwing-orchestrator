@@ -1,0 +1,19 @@
+name: Deploy SPA to Cloudflare Pages
+on: { push: { branches: [main] }, workflow_dispatch: {} }
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci --no-audit --no-fund
+      - run: npm run -w app build
+      - name: Publish to Pages
+        uses: cloudflare/pages-action@v1
+        with:
+          apiToken:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          projectName: launchwing-app         # <- pick once; re-use
+          directory: app/dist
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
