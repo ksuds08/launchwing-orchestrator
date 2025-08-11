@@ -28,6 +28,62 @@ type MvpResult = {
   smoke: { passed: boolean; logs: string[] };
 };
 
+const ORCH = "https://launchwing-orchestrator.promptpulse.workers.dev";
+const INJECTED_WORKER_TS = `export default {
+  async fetch(req, env) {
+    const url = new URL(req.url);
+    const ORCH = "${ORCH}";
+    // Proxy API (supports both /api/* and top-level endpoints)
+    const isApi = url.pathname === "/api" || url.pathname.startsWith("/api/") ||
+      url.pathname === "/mvp" || url.pathname === "/health" ||
+      url.pathname === "/github-export" || url.pathname === "/sandbox-deploy";
+
+    if (isApi) {
+      if (req.method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+            "Vary": "Origin",
+          }
+        });
+      }
+      // Normalize to upstream path (strip /api)
+      const upstreamPath = url.pathname === "/api"
+        ? "/"
+        : url.pathname.startsWith("/api/")
+          ? url.pathname.slice(4)
+          : url.pathname;
+
+      const upstream = new URL(upstreamPath + url.search, ORCH);
+      const init = {
+        method: req.method,
+        headers: req.headers,
+        body: (req.method === "GET" || req.method === "HEAD") ? undefined : req.body,
+        redirect: "manual",
+      };
+      const r = await fetch(upstream.toString(), init);
+      const h = new Headers(r.headers);
+      h.set("x-lw-proxy", "app");
+      h.set("Access-Control-Allow-Origin", "*");
+      h.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      h.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+      h.set("Vary", "Origin");
+      return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
+    }
+
+    // Static + SPA fallback
+    let res = await env.ASSETS.fetch(req);
+    if (res.status === 404 && req.method === "GET" && !(url.pathname.startsWith("/_"))) {
+      const indexReq = new Request(new URL("/index.html", url.origin), { headers: req.headers });
+      res = await env.ASSETS.fetch(indexReq);
+    }
+    return res;
+  }
+};`;
+
 export async function mvpHandler(req: Request, env: Env): Promise<Response> {
   try {
     const body = (await req.json().catch(() => ({}))) as MvpRequest;
@@ -88,21 +144,20 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
 
     // --- System / developer guidance for the model ---
     const sys = [
-      "You are an expert product+full-stack generator for Cloudflare Pages (Advanced Mode) apps.",
-      "Produce a minimal, production-ready bundle that can be deployed via Cloudflare Pages Direct Upload.",
+      "You are an expert product+full‑stack generator for Cloudflare Pages (Advanced Mode) apps.",
+      "Produce a minimal, production‑ready bundle that can be deployed via Cloudflare Pages Direct Upload.",
       "Constraints:",
       "- Avoid frameworks or build steps; output plain files (HTML, JS, CSS) and tiny server code only if necessary.",
-      "- If the app needs API, include routes handled via a Pages Advanced Mode Worker `_worker.js` or proxy `/api/*` to an orchestrator URL placeholder.",
+      "- Use relative API paths (e.g., `/api/mvp`, `/api/health`).",
+      "- If the app needs API, include routes handled via a Pages Advanced Mode Worker `_worker.ts` OR assume a proxy will map `/api/*` to the orchestrator.",
       "- Keep total bundle size small; inline assets where reasonable; no external package managers.",
       "Quality bar:",
       "- Code should run without modification after upload.",
-      "- Keep file paths stable and flat (e.g., `index.html`, `app.js`, `_worker.js`).",
+      "- Keep file paths stable and flat (e.g., `index.html`, `app.js`, `_worker.ts`).",
       "- Comment sparingly but clearly."
     ].join("\n");
 
-    // Thread comes from the UI; include ideaId as light context if present
-    const threadIntro =
-      body?.ideaId ? `Idea ID: ${body.ideaId}\n` : "";
+    const threadIntro = body?.ideaId ? `Idea ID: ${body.ideaId}\n` : "";
     const userPrompt =
       `${threadIntro}User idea:\n${idea}\n\n` +
       "Return JSON ONLY that matches the provided schema. Keep the file bundle minimal but functional.";
@@ -110,7 +165,6 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
     const input: ChatMsg[] = [{ role: "system", content: sys }];
 
     if (Array.isArray(body?.thread) && body!.thread!.length) {
-      // Append recent thread for context (already trimmed by frontend)
       for (const m of body!.thread!) {
         input.push({
           role: m.role === "assistant" || m.role === "system" ? m.role : "user",
@@ -141,11 +195,9 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
 
     const rawText = await r.text();
     if (!r.ok) {
-      // Bubble exact error for easier debugging in UI/CI
       return json({ ok: false, error: `OpenAI HTTP ${r.status} — ${rawText}` }, 502);
     }
 
-    // Responses API structure: parse robustly
     type Resp = {
       output_text?: string;
       output?: Array<{
@@ -173,7 +225,6 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
     try {
       result = JSON.parse(jsonPayload) as MvpResult;
     } catch {
-      // Attempt to salvage JSON block
       const m = jsonPayload.match(/\{[\s\S]*\}$/);
       if (!m) return json({ ok: false, error: "Could not parse JSON from model output" }, 502);
       result = JSON.parse(m[0]) as MvpResult;
@@ -185,7 +236,7 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
     result.smoke ||= { passed: true, logs: [] };
 
     const MAX_FILES = 50;
-    const MAX_BYTES = 300_000; // ~300 KB of UTF-8 text
+    const MAX_BYTES = 300_000; // ~300 KB of UTF‑8 text
     const enc = new TextEncoder();
     const outFiles: Record<string, string> = {};
     let total = 0;
@@ -202,9 +253,19 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
       n++;
     }
 
+    // === Injection: ensure `_worker.ts` exists for dynamic API proxy ===
+    const hasWorker =
+      Object.prototype.hasOwnProperty.call(outFiles, "_worker.ts") ||
+      Object.prototype.hasOwnProperty.call(outFiles, "_worker.js");
+
+    if (!hasWorker) {
+      outFiles["_worker.ts"] = INJECTED_WORKER_TS;
+      result.smoke.logs.push("Injected _worker.ts proxy → orchestrator");
+    }
+
     result.files = outFiles;
 
-    // *** Updated return with version tag ***
+    // Version tag for verification
     return json({ ok: true, result, via: "openai-mvp-v1" });
   } catch (err: any) {
     return json({ ok: false, error: String(err?.message || err || "unknown error") }, 500);
