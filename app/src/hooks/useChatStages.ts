@@ -1,5 +1,5 @@
 // app/src/hooks/useChatStages.ts
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { v4 as uuidv4 } from "uuid";
 import type { VentureStage as StageType } from "../types";
 import { GREETING } from "../constants/messages";
@@ -7,7 +7,7 @@ import { GREETING } from "../constants/messages";
 import { initializeIdea, updateIdea as rawUpdateIdea } from "./useIdeaLifecycle";
 import { useSendHandler } from "./useSendHandler";
 import { useStageTransition } from "./useStageTransition";
-import useDeploymentHandler from "./useDeploymentHandler"; // <-- default import
+import useDeploymentHandler from "./useDeploymentHandler"; // default export
 
 export default function useChatStages(onReady?: () => void) {
   const [ideas, setIdeas] = useState<any[]>([]);
@@ -15,6 +15,7 @@ export default function useChatStages(onReady?: () => void) {
   const [loading, setLoading] = useState(false);
   const [deployLogs, setDeployLogs] = useState<string[]>([]);
   const [hasStreamedGreeting, setHasStreamedGreeting] = useState(false);
+  const [initialized, setInitialized] = useState(false); // gate sending until ready
 
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
@@ -25,35 +26,37 @@ export default function useChatStages(onReady?: () => void) {
     branding: false,
   });
 
-  const activeIdea = ideas.find((i) => i.id === activeIdeaId);
+  const activeIdea = ideas.find((i) => i.id === activeIdeaId) || null;
 
-  const updateIdea = (id: any, updates: any) =>
-    rawUpdateIdea(setIdeas, id, updates);
+  const updateIdea = useCallback(
+    (id: any, updates: any) => rawUpdateIdea(setIdeas, id, updates),
+    []
+  );
 
-  // Initialize idea with blank assistant message
+  // Initialize a starter idea with a blank assistant bubble
   useEffect(() => {
-    if (!activeIdeaId && ideas.length === 0) {
-      const id = uuidv4();
-      const starter = {
-        id,
-        title: "",
-        messages: [
-          {
-            role: "assistant" as const,
-            content: "", // for streaming
-          },
-        ],
-        locked: false,
-        currentStage: "ideation" as StageType,
-        takeaways: {},
-      };
-      setIdeas([starter]);
-      setActiveIdeaId(id);
-    }
-  }, [activeIdeaId, ideas.length]);
+    if (initialized) return;
+    const id = uuidv4();
+    const starter = {
+      id,
+      title: "",
+      messages: [
+        {
+          role: "assistant" as const,
+          content: "", // for streaming greeting and first response
+        },
+      ],
+      locked: false,
+      currentStage: "ideation" as StageType,
+      takeaways: {},
+    };
+    setIdeas([starter]);
+    setActiveIdeaId(id);
+    setInitialized(true);
+  }, [initialized]);
 
   const startGreetingStream = () => {
-    if (hasStreamedGreeting || !activeIdeaId || ideas.length === 0) return;
+    if (hasStreamedGreeting || !initialized || !activeIdeaId || ideas.length === 0) return;
 
     const greeting = GREETING;
     const ideaId = activeIdeaId;
@@ -77,7 +80,7 @@ export default function useChatStages(onReady?: () => void) {
         requestAnimationFrame(() => reveal(i + 1));
       } else {
         setHasStreamedGreeting(true);
-        if (onReady) onReady();
+        onReady?.();
       }
     };
 
@@ -98,7 +101,8 @@ export default function useChatStages(onReady?: () => void) {
     setDeployLogs,
   });
 
-  const handleSend = useSendHandler({
+  // Wire up /api/mvp send logic (from hook)
+  const { send: sendFromHook } = useSendHandler({
     ideas,
     activeIdea,
     updateIdea,
@@ -107,7 +111,28 @@ export default function useChatStages(onReady?: () => void) {
     messageEndRef,
     panelRef,
     setLoading,
-  });
+  } as any);
+
+  // Provide a safe handleSend that always exists and guards on init/activeIdea
+  const handleSend = useCallback(
+    (content: string) => {
+      if (!initialized) {
+        console.warn("[Chat] handleSend called before initialization; ignoring.");
+        return;
+      }
+      if (!activeIdea) {
+        console.warn("[Chat] No active idea; ignoring send.");
+        return;
+      }
+      // surface a helpful trace so we can debug easily in the browser
+      console.log("[Chat] onSend → /api/mvp", {
+        ideaId: activeIdea.id,
+        contentPreview: String(content).slice(0, 80),
+      });
+      return sendFromHook(content);
+    },
+    [initialized, activeIdea, sendFromHook]
+  );
 
   return {
     ideas,
@@ -119,9 +144,11 @@ export default function useChatStages(onReady?: () => void) {
     togglePanel: () => {},
     messageEndRef,
     panelRef,
-    handleSend,
+    handleSend,            // always a function
     handleAdvanceStage,
     handleConfirmBuild,
     startGreetingStream,
+    // Expose init flag if the UI ever wants to disable inputs until ready
+    initialized,
   };
 }
