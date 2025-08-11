@@ -1,19 +1,15 @@
 // src/api/sandbox-deploy.ts
-// Dual‑mode sandbox deploy:
-// - mode=pages: Direct Upload to Cloudflare Pages (Advanced Mode via _worker.js)
-// - mode=workers: Publish Worker; if workers.dev unavailable, auto‑fallback to pages
-//
-// Requires API token scopes:
-//  - Account → Cloudflare Pages: Edit
-//  - Account → Workers Scripts: Edit
-//
+// Pages-first sandbox deploy with optional ephemeral cleanup.
+// - mode=pages (default): Direct Upload to Cloudflare Pages (Advanced Mode via _worker.js)
+// - mode=workers: Publish Worker; if no URL, auto-fallback to pages
+// - ephemeral: true → delete the created sandbox immediately after return (via ctx.waitUntil)
 import { json } from "@utils/log";
 
 export interface Env {
   CLOUDFLARE_API_TOKEN?: string;
   CLOUDFLARE_ACCOUNT_ID?: string;
-  ORCHESTRATOR_URL?: string;          // e.g. https://launchwing-orchestrator.promptpulse.workers.dev
-  DEFAULT_DEPLOY_MODE?: string;        // "pages" | "workers"
+  ORCHESTRATOR_URL?: string;
+  DEFAULT_DEPLOY_MODE?: string; // "pages" | "workers"
 }
 
 type DeployRequest = {
@@ -21,6 +17,7 @@ type DeployRequest = {
   mode?: "pages" | "workers";
   name?: string;
   ideaId?: string;
+  ephemeral?: boolean;
 };
 
 type DeployResult = {
@@ -71,6 +68,24 @@ function pickName(prefix: string) {
   return `${prefix}-${rand}`;
 }
 
+/* -------------------------- deletion helpers ---------------------------- */
+
+async function deletePagesProject(env: Env, name: string): Promise<void> {
+  const account = requireAccount(env);
+  await fetch(`${CF_API}/accounts/${account}/pages/projects/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+    headers: { ...bearer(env) },
+  });
+}
+
+async function deleteWorkerScript(env: Env, name: string): Promise<void> {
+  const account = requireAccount(env);
+  await fetch(`${CF_API}/accounts/${account}/workers/scripts/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+    headers: { ...bearer(env) },
+  });
+}
+
 /* ----------------------- Pages Direct Upload deploy ---------------------- */
 
 async function deployPagesDirect(env: Env, name: string): Promise<{ url: string }> {
@@ -83,10 +98,7 @@ async function deployPagesDirect(env: Env, name: string): Promise<{ url: string 
       body: JSON.stringify({
         name,
         production_branch: "main",
-        build_config: {
-          build_command: "",     // direct upload
-          destination_dir: "/",  // upload files to root
-        },
+        build_config: { build_command: "", destination_dir: "/" },
       }),
     });
   } catch (e: any) {
@@ -94,8 +106,7 @@ async function deployPagesDirect(env: Env, name: string): Promise<{ url: string 
   }
 
   // 2) Minimal SPA + Advanced Mode worker that proxies /api/* to orchestrator
-  const ORCH =
-    env.ORCHESTRATOR_URL || "https://launchwing-orchestrator.promptpulse.workers.dev";
+  const ORCH = env.ORCHESTRATOR_URL || "https://launchwing-orchestrator.promptpulse.workers.dev";
 
   const indexHtml = `<!doctype html>
 <html>
@@ -186,13 +197,10 @@ export default {
     "_worker.js": workerJs,
   };
 
-  // 3) ✅ Direct Upload via FormData + File (Workers sets multipart boundary)
+  // 3) Direct Upload via FormData + File (Workers sets multipart boundary)
   const enc = new TextEncoder();
-
   const manifest = {
-    files: Object.fromEntries(
-      Object.entries(files).map(([path, content]) => [path, { size: enc.encode(content).length }])
-    ),
+    files: Object.fromEntries(Object.entries(files).map(([p, c]) => [p, { size: enc.encode(c).length }])),
   };
 
   const fd = new FormData();
@@ -204,14 +212,7 @@ export default {
 
   const dep = await fetch(
     `${CF_API}/accounts/${account}/pages/projects/${encodeURIComponent(name)}/deployments`,
-    {
-      method: "POST",
-      headers: {
-        ...bearer(env),
-        // DO NOT set content-type; Workers runtime will add boundary automatically
-      },
-      body: fd,
-    }
+    { method: "POST", headers: { ...bearer(env) }, body: fd }
   );
 
   const depText = await dep.text();
@@ -222,10 +223,7 @@ export default {
 
   const result = depJson?.result || depJson;
   const primary = result?.url || result?.domains?.[0];
-  const url = primary
-    ? (/^https?:\/\//i.test(primary) ? primary : `https://${primary}`)
-    : `https://${name}.pages.dev`;
-
+  const url = primary ? (/^https?:\/\//i.test(primary) ? primary : `https://${primary}`) : `https://${name}.pages.dev`;
   return { url };
 }
 
@@ -234,69 +232,52 @@ export default {
 async function deployWorker(env: Env, name: string): Promise<{ url?: string }> {
   const account = requireAccount(env);
   const code = `export default { fetch() { return new Response("OK: ${name}", {status: 200}); } };`;
-
-  const r = await fetch(
-    `${CF_API}/accounts/${account}/workers/scripts/${encodeURIComponent(name)}`,
-    {
-      method: "PUT",
-      headers: {
-        "content-type": "application/javascript",
-        ...bearer(env),
-      },
-      body: code,
-    }
-  );
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Worker upload failed: HTTP ${r.status} — ${t}`);
-  }
-  // No URL guaranteed without routes or workers.dev
-  return { url: undefined };
+  const r = await fetch(`${CF_API}/accounts/${account}/workers/scripts/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: { "content-type": "application/javascript", ...bearer(env) },
+    body: code,
+  });
+  if (!r.ok) { const t = await r.text(); throw new Error(`Worker upload failed: HTTP ${r.status} — ${t}`); }
+  return { url: undefined }; // no URL without routes/workers.dev
 }
 
 /* -------------------------------- handler -------------------------------- */
 
-export async function sandboxDeployHandler(req: Request, env: Env): Promise<Response> {
+export async function sandboxDeployHandler(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
     const payload = (await req.json().catch(() => ({}))) as DeployRequest;
-    if (!payload?.confirm) {
-      const res: DeployResult = { ok: false, error: "confirm=false" };
-      return json(res, 400);
-    }
+    if (!payload?.confirm) return json({ ok: false, error: "confirm=false" }, 400);
 
     const desired = (payload.mode || env.DEFAULT_DEPLOY_MODE || "pages") as "pages" | "workers";
-    const name = (payload.name || pickName("lw-sbx"))
-      .toLowerCase()
-      .replace(/[^a-z0-9\-]/g, "-");
+    const name = (payload.name || pickName("lw-sbx")).toLowerCase().replace(/[^a-z0-9\-]/g, "-");
+    const ephemeral = Boolean(payload.ephemeral);
 
     if (desired === "workers") {
       try {
         const w = await deployWorker(env, name);
         if (!w.url) {
-          // No public URL -> auto-fallback to Pages so user gets a usable endpoint
           const p = await deployPagesDirect(env, name);
-          const res: DeployResult = { ok: true, name, url: p.url, fallback: "pages" };
-          return json(res);
+          if (ephemeral) ctx.waitUntil(deletePagesProject(env, name));
+          return json({ ok: true, name, url: p.url, fallback: "pages" });
         }
-        const res: DeployResult = { ok: true, name, url: w.url };
-        return json(res);
+        if (ephemeral) ctx.waitUntil(deleteWorkerScript(env, name));
+        return json({ ok: true, name, url: w.url });
       } catch (e: any) {
         const msg = String(e?.message || e);
         if (/workers\.dev.*disabled|workers_dev/i.test(msg)) {
           const p = await deployPagesDirect(env, name);
-          const res: DeployResult = { ok: true, name, url: p.url, fallback: "pages" };
-          return json(res);
+          if (ephemeral) ctx.waitUntil(deletePagesProject(env, name));
+          return json({ ok: true, name, url: p.url, fallback: "pages" });
         }
         throw e;
       }
     }
 
-    // Default: Pages (Advanced Mode)
+    // Default: Pages
     const p = await deployPagesDirect(env, name);
-    const res: DeployResult = { ok: true, name, url: p.url };
-    return json(res);
+    if (ephemeral) ctx.waitUntil(deletePagesProject(env, name));
+    return json({ ok: true, name, url: p.url });
   } catch (err: any) {
-    const res: DeployResult = { ok: false, error: String(err?.message || err || "unknown error") };
-    return json(res, 500);
+    return json({ ok: false, error: String(err?.message || err || "unknown error") }, 500);
   }
 }
