@@ -1,14 +1,21 @@
 // src/api/mvp.ts
-// Generates a per-idea plan (IR) + file bundle using OpenAI Responses API.
+// Generate a per-idea plan (IR) + deployable file bundle via OpenAI Responses API.
 
 import { json } from "@utils/log";
 
 export interface Env {
   OPENAI_API_KEY?: string;
-  OPENAI_MODEL?: string; // e.g. "gpt-4.1-mini" (default below)
+  OPENAI_MODEL?: string; // optional override, default below
 }
 
-type MvpRequest = { idea?: string };
+type ChatMsg = { role: "system" | "user" | "assistant"; content: string };
+
+type MvpRequest = {
+  idea?: string;
+  ideaId?: string;
+  thread?: ChatMsg[]; // optional compact chat history from the UI
+};
+
 type MvpResult = {
   ir: {
     name: string;
@@ -32,7 +39,7 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
 
     const model = env.OPENAI_MODEL || "gpt-4.1-mini";
 
-    // JSON schema for robust output
+    // --- Output schema the model must follow ---
     const schema = {
       type: "object",
       additionalProperties: false,
@@ -63,7 +70,8 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
         files: {
           type: "object",
           additionalProperties: { type: "string" },
-          description: "Map of file path → file contents (UTF-8 text). Include index.html and/or _worker.js as needed."
+          description:
+            "Map of file path → UTF-8 contents. Keep the bundle tiny and deployable on Cloudflare Pages Direct Upload (Advanced Mode). Prefer vanilla HTML/JS, inline assets, and zero build steps."
         },
         smoke: {
           type: "object",
@@ -78,81 +86,125 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
       required: ["ir", "files", "smoke"]
     };
 
+    // --- System / developer guidance for the model ---
     const sys = [
-      "You generate minimal, production-ready app bundles for Cloudflare Pages (Advanced Mode).",
-      "Output a small set of files that can be deployed as-is via direct upload.",
-      "Best practice:",
-      "- If the app has frontend only, include index.html (can inline CSS/JS).",
-      "- If the app needs API routes, add `_worker.js` that proxies `/api/*` to an orchestrator URL env var OR provides simple handlers.",
-      "- Keep it tiny but functional. No external build steps.",
-      "All files must be safe UTF-8 text."
+      "You are an expert product+full‑stack generator for Cloudflare Pages (Advanced Mode) apps.",
+      "Produce a minimal, production‑ready bundle that can be deployed via Cloudflare Pages Direct Upload.",
+      "Constraints:",
+      "- Avoid frameworks or build steps; output plain files (HTML, JS, CSS) and tiny server code only if necessary.",
+      "- If the app needs API, include routes handled via a Pages Advanced Mode Worker `_worker.js` or proxy `/api/*` to an orchestrator URL placeholder.",
+      "- Keep total bundle size small; inline assets where reasonable; no external package managers.",
+      "Quality bar:",
+      "- Code should run without modification after upload.",
+      "- Keep file paths stable and flat (e.g., `index.html`, `app.js`, `_worker.js`).",
+      "- Comment sparingly but clearly."
     ].join("\n");
 
-    const user = `Idea: ${idea}\n\nReturn JSON only that matches the provided schema.`;
+    // Thread comes from the UI; include ideaId as light context if present
+    const threadIntro =
+      body?.ideaId ? `Idea ID: ${body.ideaId}\n` : "";
+    const userPrompt =
+      `${threadIntro}User idea:\n${idea}\n\n` +
+      "Return JSON ONLY that matches the provided schema. Keep the file bundle minimal but functional.";
 
-    const openaiRes = await fetch("https://api.openai.com/v1/responses", {
+    const input: ChatMsg[] = [{ role: "system", content: sys }];
+
+    if (Array.isArray(body?.thread) && body!.thread!.length) {
+      // Append recent thread for context (already trimmed by frontend)
+      for (const m of body!.thread!) {
+        input.push({
+          role: m.role === "assistant" || m.role === "system" ? m.role : "user",
+          content: String(m.content || "")
+        });
+      }
+    }
+    input.push({ role: "user", content: userPrompt });
+
+    // --- Call OpenAI Responses API ---
+    const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
-        "authorization": `Bearer ${apiKey}`,
+        authorization: `Bearer ${apiKey}`,
         "content-type": "application/json"
       },
       body: JSON.stringify({
         model,
-        input: [
-          { role: "system", content: sys },
-          { role: "user", content: user }
-        ],
-        response_format: { type: "json_schema", json_schema: { name: "mvp_bundle", schema, strict: true } },
+        input,
+        response_format: {
+          type: "json_schema",
+          json_schema: { name: "mvp_bundle", schema, strict: true }
+        },
         temperature: 0.3,
-        max_output_tokens: 3000
+        max_output_tokens: 3500
       })
     });
 
-    const text = await openaiRes.text();
-    if (!openaiRes.ok) {
-      return json({ ok: false, error: `OpenAI HTTP ${openaiRes.status} — ${text}` }, 502);
+    const rawText = await r.text();
+    if (!r.ok) {
+      // Bubble exact error for easier debugging in UI/CI
+      return json({ ok: false, error: `OpenAI HTTP ${r.status} — ${rawText}` }, 502);
     }
 
-    // Parse OpenAI responses payload
-    type OpenAIJson = {
-      output?: Array<{ content?: Array<{ type: string; text?: { value?: string } }> }>;
+    // Responses API structure: parse robustly
+    type Resp = {
+      output_text?: string;
+      output?: Array<{
+        content?: Array<{ type: string; text?: { value?: string } }>;
+      }>;
     };
-    let payload: OpenAIJson;
-    try { payload = JSON.parse(text); } catch { return json({ ok: false, error: "Bad JSON from OpenAI" }, 502); }
 
-    const raw = payload?.output?.[0]?.content?.[0]?.text?.value || "";
-    if (!raw) return json({ ok: false, error: "Empty model output" }, 502);
-
-    let parsed: MvpResult;
-    try { parsed = JSON.parse(raw) as MvpResult; } catch {
-      // Fallback: try to salvage JSON from text
-      const match = raw.match(/\{[\s\S]*\}$/);
-      if (!match) return json({ ok: false, error: "Could not parse JSON from model output" }, 502);
-      parsed = JSON.parse(match[0]) as MvpResult;
+    let parsedResp: Resp;
+    try {
+      parsedResp = JSON.parse(rawText) as Resp;
+    } catch {
+      return json({ ok: false, error: "Malformed JSON from OpenAI" }, 502);
     }
 
-    // Safety net: ensure keys exist
-    parsed.ir ||= { name: "Generated App", app_type: "spa_api" } as any;
-    parsed.files ||= {};
-    parsed.smoke ||= { passed: true, logs: [] };
+    const jsonPayload =
+      parsedResp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text?.value ??
+      parsedResp.output_text ??
+      "";
 
-    // Minimal guardrails: cap file count/size
-    const MAX_FILES = 40;
-    const MAX_BYTES = 200_000; // ~200 KB total text
+    if (!jsonPayload) {
+      return json({ ok: false, error: "Empty model output" }, 502);
+    }
+
+    let result: MvpResult;
+    try {
+      result = JSON.parse(jsonPayload) as MvpResult;
+    } catch {
+      // Attempt to salvage JSON block
+      const m = jsonPayload.match(/\{[\s\S]*\}$/);
+      if (!m) return json({ ok: false, error: "Could not parse JSON from model output" }, 502);
+      result = JSON.parse(m[0]) as MvpResult;
+    }
+
+    // --- Guardrails on files (count/size) ---
+    result.ir ||= { name: "Generated App", app_type: "spa_api" } as any;
+    result.files ||= {};
+    result.smoke ||= { passed: true, logs: [] };
+
+    const MAX_FILES = 50;
+    const MAX_BYTES = 300_000; // ~300 KB of UTF‑8 text
     const enc = new TextEncoder();
-    const entries = Object.entries(parsed.files).slice(0, MAX_FILES);
+    const outFiles: Record<string, string> = {};
     let total = 0;
-    const files: Record<string, string> = {};
-    for (const [path, content] of entries) {
-      const safePath = path.replace(/^\/+/, "");
-      const bytes = enc.encode(content ?? "").length;
-      total += bytes;
-      if (total > MAX_BYTES) break;
-      files[safePath] = String(content ?? "");
-    }
-    parsed.files = files;
+    let n = 0;
 
-    return json({ ok: true, result: parsed });
+    for (const [path0, content0] of Object.entries(result.files)) {
+      if (n >= MAX_FILES) break;
+      const path = String(path0 || "").replace(/^\/+/, "");
+      const content = String(content0 ?? "");
+      const sz = enc.encode(content).length;
+      if (total + sz > MAX_BYTES) break;
+      outFiles[path] = content;
+      total += sz;
+      n++;
+    }
+
+    result.files = outFiles;
+
+    return json({ ok: true, result });
   } catch (err: any) {
     return json({ ok: false, error: String(err?.message || err || "unknown error") }, 500);
   }
