@@ -1,19 +1,37 @@
 name: Deploy SPA to Cloudflare Pages
-on: { push: { branches: [main] }, workflow_dispatch: {} }
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      # Keep npm from failing on peer-dep noise in CI
+      NPM_CONFIG_LEGACY_PEER_DEPS: "true"
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
-        with: { node-version: 22 }
-      - run: npm ci --no-audit --no-fund
-      - run: npm run -w app build
+        with:
+          node-version: "22"
+
+      # Monorepo-safe install (no lockfile required)
+      - name: Install deps
+        run: npm install --no-audit --no-fund -ws
+
+      # Build the Vite SPA in /app
+      - name: Build SPA → app/dist
+        run: npm run -w app build
+
       - name: Publish to Pages
         uses: cloudflare/pages-action@v1
         with:
           apiToken:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: launchwing-app         # <- pick once; re-use
+          projectName: launchwing-app
           directory: app/dist
           gitHubToken: ${{ secrets.GITHUB_TOKEN }}
