@@ -1,5 +1,6 @@
 // src/api/mvp.ts
 // Generate a per-idea plan (IR) + deployable file bundle via OpenAI Responses API.
+// Adds structured logs so you can tail from CI or the CF dashboard.
 
 import { json } from "@utils/log";
 
@@ -90,13 +91,20 @@ const INJECTED_WORKER_JS = `export default {
 };`;
 
 export async function mvpHandler(req: Request, env: Env): Promise<Response> {
+  const t0 = Date.now();
   try {
     const body = (await req.json().catch(() => ({}))) as MvpRequest;
     const idea = (body?.idea || "").trim();
-    if (!idea) return json({ ok: false, error: "Missing idea" }, 400);
+    if (!idea) {
+      console.log(JSON.stringify({ evt: "mvp.reject", reason: "missing_idea" }));
+      return json({ ok: false, error: "Missing idea" }, 400);
+    }
 
     const apiKey = env.OPENAI_API_KEY;
-    if (!apiKey) return json({ ok: false, error: "Missing OPENAI_API_KEY" }, 500);
+    if (!apiKey) {
+      console.log(JSON.stringify({ evt: "mvp.reject", reason: "missing_openai_key" }));
+      return json({ ok: false, error: "Missing OPENAI_API_KEY" }, 500);
+    }
 
     const model = env.OPENAI_MODEL || "gpt-4.1-mini";
 
@@ -179,6 +187,8 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
     }
     input.push({ role: "user", content: userPrompt });
 
+    console.log(JSON.stringify({ evt: "mvp.openai.start", model, idea_len: idea.length }));
+
     // --- Call OpenAI Responses API ---
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -199,8 +209,9 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
     });
 
     const rawText = await r.text();
+    console.log(JSON.stringify({ evt: "mvp.openai.done", status: r.status, ms: Date.now() - t0, bytes: rawText.length }));
+
     if (!r.ok) {
-      // Bubble exact error for easier debugging in UI/CI
       return json({ ok: false, error: `OpenAI HTTP ${r.status} — ${rawText}` }, 502);
     }
 
@@ -215,6 +226,7 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
     try {
       parsedResp = JSON.parse(rawText) as Resp;
     } catch {
+      console.log(JSON.stringify({ evt: "mvp.parse.fail", reason: "not_json", ms: Date.now() - t0 }));
       return json({ ok: false, error: "Malformed JSON from OpenAI" }, 502);
     }
 
@@ -224,6 +236,7 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
       "";
 
     if (!jsonPayload) {
+      console.log(JSON.stringify({ evt: "mvp.parse.fail", reason: "empty_payload", ms: Date.now() - t0 }));
       return json({ ok: false, error: "Empty model output" }, 502);
     }
 
@@ -232,7 +245,10 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
       result = JSON.parse(jsonPayload) as MvpResult;
     } catch {
       const m = jsonPayload.match(/\{[\s\S]*\}$/);
-      if (!m) return json({ ok: false, error: "Could not parse JSON from model output" }, 502);
+      if (!m) {
+        console.log(JSON.stringify({ evt: "mvp.parse.fail", reason: "json_extract_failed", ms: Date.now() - t0 }));
+        return json({ ok: false, error: "Could not parse JSON from model output" }, 502);
+      }
       result = JSON.parse(m[0]) as MvpResult;
     }
 
@@ -262,18 +278,21 @@ export async function mvpHandler(req: Request, env: Env): Promise<Response> {
     // === Injection: ensure `_worker.js` exists for dynamic API proxy ===
     const hasWorker =
       Object.prototype.hasOwnProperty.call(outFiles, "_worker.js") ||
-      Object.prototype.hasOwnProperty.call(outFiles, "_worker.ts"); // tolerate model output
+      Object.prototype.hasOwnProperty.call(outFiles, "_worker.ts");
 
     if (!hasWorker) {
       outFiles["_worker.js"] = INJECTED_WORKER_JS;
       result.smoke.logs.push("Injected _worker.js proxy → orchestrator");
+      console.log(JSON.stringify({ evt: "mvp.inject.worker", file: "_worker.js" }));
     }
 
     result.files = outFiles;
 
-    // Version tag for verification
-    return json({ ok: true, result, via: "openai-mvp-v1" });
+    const ms = Date.now() - t0;
+    console.log(JSON.stringify({ evt: "mvp.success", ms, files: Object.keys(outFiles).length, bytes: total }));
+    return json({ ok: true, result, via: "openai-mvp-v1", via_detail: { ms } });
   } catch (err: any) {
+    console.log(JSON.stringify({ evt: "mvp.error", err: String(err?.message || err) }));
     return json({ ok: false, error: String(err?.message || err || "unknown error") }, 500);
   }
 }
