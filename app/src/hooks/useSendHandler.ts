@@ -1,4 +1,5 @@
 // app/src/hooks/useSendHandler.ts
+import { useRef } from "react";
 import type React from "react";
 
 type Args = {
@@ -55,7 +56,6 @@ async function streamText(
 
 /** Serialize a thread to a compact history for the backend */
 function serializeHistory(messages: Array<{ role: string; content: string }>, maxChars = 8000) {
-  // Keep the most recent messages until ~maxChars
   const out: Array<{ role: "user" | "assistant" | "system"; content: string }> = [];
   let total = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -103,38 +103,26 @@ function buildAssistantMarkdown(data: any): string {
   return s;
 }
 
-/**
- * Hook:
- * - Keeps per-idea generated files in-memory (filesByIdea)
- * - Sends chat history to /mvp so OpenAI gets context
- * - On /build, posts the saved files to /sandbox-deploy
- */
 export function useSendHandler(args: Args) {
   const { ideas, activeIdea, updateIdea, messageEndRef, setLoading } = args;
 
   // Per-idea files (what /mvp returned last)
-  const filesByIdea = React.useRef<Map<string, Record<string, string>>>(new Map());
+  const filesByIdea = useRef<Map<string, Record<string, string>>>(new Map());
 
-  // Handles /build command (streams deploy logs + shows real URL)
+  // Handles /build command
   async function handleBuildCommand(threadId: string) {
     let thread = (ideas.find((i) => i.id === threadId) ?? activeIdea)?.messages ?? [];
-
-    // Insert deploy placeholder
     const placeholder = { role: "assistant", content: "Starting build & deploy..." };
     updateIdea(threadId, { messages: [...thread, placeholder] });
     scrollToEnd(messageEndRef);
 
     try {
-      // Pull the files for this idea/thread
       const files = filesByIdea.current.get(threadId);
-
-      // Kick off backend deploy
       const resp = await postJSON<{ ok: boolean; url?: string; name?: string; error?: string }>(
         "/sandbox-deploy",
         { confirm: true, mode: "pages", files }
       );
 
-      // Simulate streaming logs while deploy runs
       const lines = [
         "Packaging artifacts...",
         "Generating repository files",
@@ -172,8 +160,7 @@ export function useSendHandler(args: Args) {
     } catch (err: any) {
       thread = (ideas.find((i) => i.id === threadId) ?? activeIdea)?.messages ?? [];
       const updated = [...thread];
-      const msg =
-        "**Deploy failed:** " + (err?.message ? String(err.message) : String(err || "Unknown error"));
+      const msg = "**Deploy failed:** " + (err?.message ? String(err.message) : String(err || "Unknown error"));
       updated[updated.length - 1] = { role: "assistant", content: msg };
       updateIdea(threadId, { messages: updated });
     } finally {
@@ -212,29 +199,19 @@ export function useSendHandler(args: Args) {
 
       type MvpResp = {
         ok: boolean;
-        result?: {
-          ir: any;
-          files?: Record<string, string>;
-          smoke: { passed: boolean; logs: string[] };
-        };
+        result?: { ir: any; files?: Record<string, string>; smoke: { passed: boolean; logs: string[] } };
         error?: string;
       };
 
-      // Send the idea + thread history; backend will call OpenAI and return files
-      const data = await postJSON<MvpResp>("/mvp", {
-        idea: content,
-        thread: history,
-        ideaId: id
-      });
+      const data = await postJSON<MvpResp>("/mvp", { idea: content, thread: history, ideaId: id });
 
-      // Save files per idea for the /build step
+      // Save files for this idea for the /build step
       if (data?.ok && data.result?.files) {
         filesByIdea.current.set(id, data.result.files);
       }
 
       const markdown = buildAssistantMarkdown(data);
 
-      // 3) Stream plan content into placeholder
       await streamText(
         markdown,
         (partial) => {
@@ -258,8 +235,7 @@ export function useSendHandler(args: Args) {
     } catch (err: any) {
       thread = (ideas.find((i) => i.id === id) ?? activeIdea)?.messages ?? [];
       const updated = [...thread];
-      const msg =
-        "**Request failed:** " + (err?.message ? String(err.message) : String(err || "Unknown error"));
+      const msg = "**Request failed:** " + (err?.message ? String(err.message) : String(err || "Unknown error"));
       updated[updated.length - 1] = { role: "assistant", content: msg };
       updateIdea(id, { messages: updated });
     } finally {
