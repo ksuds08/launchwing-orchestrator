@@ -1,5 +1,6 @@
 // app/src/hooks/useDeploymentHandler.ts
-// Deploys the stored bundle when the user clicks "Build & Deploy" and streams logs + final URL.
+// Streams deployment steps by rewriting a single assistant message.
+// Uses ONLY plain-object updates (no functional updates).
 
 import { useCallback } from "react";
 import { postJSON } from "../lib/api";
@@ -20,25 +21,12 @@ type Idea = {
 
 export default function useDeploymentHandler(opts: {
   ideas: Idea[];
-  updateIdea: (id: string, updates: Partial<Idea> | ((prev: any) => Partial<Idea>)) => void;
+  updateIdea: (id: string, updates: Partial<Idea>) => void; // plain-object only
   setDeployLogs?: (logs: string[]) => void;
 }) {
   const { ideas, updateIdea, setDeployLogs } = opts;
 
-  const append = (id: string, line: string) => {
-    updateIdea(id, (prev: any) => {
-      const messages = Array.isArray(prev?.messages) ? prev.messages.slice() : [];
-      const last = messages[messages.length - 1];
-      if (last && last.role === "assistant") {
-        messages[messages.length - 1] = { ...last, content: (last.content || "") + `\n${line}` };
-      } else {
-        messages.push({ role: "assistant", content: line });
-      }
-      return { ...prev, messages };
-    });
-  };
-
-  const deploy = useCallback(
+  return useCallback(
     async (params?: { id?: string }) => {
       const id = params?.id || ideas[ideas.length - 1]?.id;
       const idea = ideas.find((i) => i.id === id);
@@ -46,17 +34,30 @@ export default function useDeploymentHandler(opts: {
 
       const files = idea.bundle;
       if (!files || !Object.keys(files).length) {
-        append(id, "❌ No build bundle available to deploy.");
+        // append a fresh assistant bubble with error
+        const base = Array.isArray(idea.messages) ? idea.messages.slice() : [];
+        updateIdea(id, { messages: [...base, { role: "assistant", content: "❌ No build bundle available to deploy." }] });
         return;
       }
+
+      // Prepare a single assistant bubble we will keep overwriting
+      const base = Array.isArray(idea.messages) ? idea.messages.slice() : [];
+      let transcript = "";
+      const flush = () =>
+        updateIdea(id, { messages: [...base, { role: "assistant", content: transcript }] });
+
+      const push = (line: string) => {
+        transcript += (transcript ? "\n" : "") + line;
+        flush();
+      };
 
       // Preflight summary
       const entries = Object.entries(files);
       const totalBytes = entries.reduce((acc, [, c]) => acc + new TextEncoder().encode(String(c ?? "")).length, 0);
       const fileCount = entries.length;
-      append(id, `🚀 Build & Deploy started (${fileCount} files, ~${Math.round(totalBytes / 1024)} KB)…`);
 
-      const steps = [
+      push(`🚀 Build & Deploy started (${fileCount} files, ~${Math.round(totalBytes / 1024)} KB)…`);
+      [
         "Packaging artifacts…",
         "Generating repository files…",
         "Running typecheck…",
@@ -65,35 +66,28 @@ export default function useDeploymentHandler(opts: {
         "Running smoke tests…",
         "Uploading to Cloudflare…",
         "Activating new version…",
-      ];
-      steps.forEach((s) => append(id, s));
+      ].forEach(push);
 
       try {
-        const res = await postJSON<DeployResp>("/api/sandbox-deploy", {
-          id,
-          files,
-          confirm: true,
-        });
+        const res = await postJSON<DeployResp>("/api/sandbox-deploy", { id, files, confirm: true });
 
         if (Array.isArray(res?.logs)) {
-          res.logs.forEach((l) => append(id, l));
+          res.logs.forEach(push);
           setDeployLogs?.(res.logs);
         }
 
         if (!res?.ok) {
-          append(id, `❌ Deployment failed. ${res?.error || ""}`.trim());
+          push(`❌ Deployment failed. ${res?.error || ""}`.trim());
           return;
         }
 
-        append(id, "✅ Deployment complete.");
-        if (res.url) append(id, `**App URL:** ${res.url}`);
-        if (res.repo) append(id, `**Repo:** ${res.repo}`);
+        push("✅ Deployment complete.");
+        if (res.url) push(`**App URL:** ${res.url}`);
+        if (res.repo) push(`**Repo:** ${res.repo}`);
       } catch (e: any) {
-        append(id, `❌ Deployment error: ${String(e?.message || e)}`);
+        push(`❌ Deployment error: ${String(e?.message || e)}`);
       }
     },
     [ideas, updateIdea, setDeployLogs]
   );
-
-  return deploy;
 }
