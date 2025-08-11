@@ -11,12 +11,17 @@ export interface Env {
   // Non-secret var in wrangler.toml [vars]
   CF_WORKERS_SUBDOMAIN?: string;
 
-  // Static assets binding from wrangler.toml [assets]
+  // Optional: allow-list a single frontend origin (Pages/custom domain)
+  // e.g. "https://launchwing-app.pages.dev" or "https://app.yourdomain.com"
+  ALLOW_ORIGIN?: string;
+
+  // Static assets binding from wrangler.toml [assets] (safe to keep even if SPA moves to Pages)
   ASSETS: Fetcher;
 }
 
 type H = (req: Request, env: Env, ctx: ExecutionContext) => Promise<Response>;
 
+// -------------------- API routes --------------------
 const routes: Record<string, Partial<Record<string, H>>> = {
   "/health": { GET: async () => json({ ok: true }) },
   "/mvp": { POST: mvpHandler },
@@ -24,7 +29,30 @@ const routes: Record<string, Partial<Record<string, H>>> = {
   "/github-export": { POST: githubExportHandler }
 };
 
-// Serve static assets and SPA fallback to /index.html
+// -------------------- CORS helpers --------------------
+function corsHeaders(env: Env): Record<string, string> {
+  // Default to a safe explicit origin if provided; as a last resort use "*"
+  const origin = env.ALLOW_ORIGIN ?? "*";
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization",
+    "Vary": "Origin"
+  };
+}
+
+function withCors(env: Env, res: Response) {
+  const h = new Headers(res.headers);
+  const c = corsHeaders(env);
+  Object.entries(c).forEach(([k, v]) => h.set(k, v));
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+}
+
+function preflight(env: Env): Response {
+  return new Response(null, { status: 204, headers: corsHeaders(env) });
+}
+
+// -------------------- Static assets / SPA fallback --------------------
 async function serveAssets(req: Request, env: Env): Promise<Response> {
   // 1) Try to serve the exact asset
   const assetRes = await env.ASSETS.fetch(req);
@@ -39,20 +67,31 @@ async function serveAssets(req: Request, env: Env): Promise<Response> {
     const indexRes = await env.ASSETS.fetch(indexReq);
     if (indexRes.status !== 404) return indexRes;
   }
-
   return new Response("Not found", { status: 404 });
 }
 
+// -------------------- Worker entry --------------------
 export default {
   async fetch(req, env, ctx): Promise<Response> {
     const url = new URL(req.url);
     const method = req.method.toUpperCase();
 
-    // API routes first
-    const match = routes[url.pathname]?.[method];
-    if (match) return match(req, env, ctx);
+    // Is this an API route we know about?
+    const isApiPath = Boolean(routes[url.pathname]);
 
-    // Otherwise try to serve the SPA/assets
+    // Handle CORS preflight for API routes
+    if (isApiPath && method === "OPTIONS") {
+      return preflight(env);
+    }
+
+    // API routes first
+    const handler = routes[url.pathname]?.[method];
+    if (handler) {
+      const res = await handler(req, env, ctx);
+      return withCors(env, res);
+    }
+
+    // Otherwise try to serve the SPA/assets (no CORS headers needed)
     return serveAssets(req, env);
   }
 } satisfies ExportedHandler<Env>;
