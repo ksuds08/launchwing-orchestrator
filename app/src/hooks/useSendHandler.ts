@@ -1,5 +1,5 @@
 // app/src/hooks/useSendHandler.ts
-// Calls /api/mvp?debug=1 and SIMULATES streaming by overwriting the assistant message. test.
+// Calls /api/mvp?debug=1 and SIMULATES streaming by overwriting the assistant message.
 // Renders plan + code previews + OpenAI debug payloads (truncated).
 
 import { useCallback, useRef } from "react";
@@ -37,7 +37,7 @@ type MvpResp = {
 type UseSendHandlerOpts = {
   ideas: any[];
   activeIdea: any | null;
-  updateIdea: (id: any, updates: any) => void; // plain-object updates only
+  updateIdea: (id: any, updates: any) => void;
   handleAdvanceStage?: (...args: any[]) => void;
   handleConfirmBuild?: (...args: any[]) => void;
   messageEndRef?: React.RefObject<HTMLDivElement>;
@@ -48,7 +48,7 @@ type UseSendHandlerOpts = {
 const MAX_PREVIEW_BYTES = 4_000;
 const MAX_PREVIEW_LINES = 120;
 const MAX_FILES_PREVIEW = 12;
-const MAX_DEBUG_CHARS = 2000; // show up to ~2KB per debug block
+const MAX_DEBUG_CHARS = 2000;
 
 function extToLang(path: string): string {
   const p = path.toLowerCase();
@@ -90,61 +90,61 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
       if (!ideaText || !active?.id) return;
       const id = active.id;
 
-      // Snapshot prior messages (no functional updates)
       const prior: ChatMsg[] = Array.isArray(active.messages) ? active.messages.slice() : [];
-
-      // 1) Show user message + placeholder
       const baseMsgs: ChatMsg[] = [...prior, { role: "user", content: ideaText }];
+
       opts.setLoading?.(true);
       opts.updateIdea(id, { messages: [...baseMsgs, { role: "assistant", content: "Generating plan and code…" }] });
 
-      // Helper to overwrite last assistant bubble with full text
       const renderAssistant = (full: string) => {
         opts.updateIdea(id, { messages: [...baseMsgs, { role: "assistant", content: full }] });
-        if (opts.messageEndRef?.current) {
-          opts.messageEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
-        }
+        opts.messageEndRef?.current?.scrollIntoView({ behavior: "smooth", block: "end" });
       };
 
       try {
-        // 2) Call orchestrator with debug enabled
+        // --- Call orchestrator ---
         const data = await postJSON<MvpResp>("/api/mvp?debug=1", {
           idea: ideaText,
           ideaId: id,
           thread: baseMsgs,
         });
 
+        // --- DEBUG PROOF BLOCK ---
+        renderAssistant(
+          [
+            "### Raw /api/mvp JSON (for proof)",
+            "```json",
+            JSON.stringify(data, null, 2).slice(0, 5000) + (JSON.stringify(data).length > 5000 ? "… (truncated)" : ""),
+            "```",
+            "",
+            "_(This is temporary debug output to prove OpenAI results are being returned)_",
+            "",
+          ].join("\n")
+        );
+        // -------------------------
+
         if (!data?.ok) {
           renderAssistant(`❌ ${data?.error || "MVP generation failed"}`);
           return;
         }
 
-        // 3) Choose files map
         const bundle: Record<string, string> | undefined =
-          (data?.result as any)?.files ??
-          (data?.result as any)?.artifacts ??
-          undefined;
+          data.result?.files ?? data.result?.artifacts ?? undefined;
 
         if (!bundle || !Object.keys(bundle).length) {
           renderAssistant("❌ No files returned from /api/mvp");
           return;
         }
 
-        // Persist bundle and stage
         filesByIdea.current.set(id, bundle);
-        opts.updateIdea(id, {
-          bundle,
-          ir: data?.result?.ir,
-          currentStage: "build",
-        });
+        opts.updateIdea(id, { bundle, ir: data.result?.ir, currentStage: "build" });
 
-        // 4) Build transcript (plan + code previews + OPENAI DEBUG)
-        const ir = data?.result?.ir || {};
-        const logs = data?.result?.smoke?.logs || [];
-        const model = data?.model || "unknown-model";
-        const reqId = data?.oai_request_id || "n/a";
-        const took = (data?.took_ms ?? 0) > 0 ? `${data!.took_ms}ms` : "n/a";
-        const via = data?.via ? ` (${data.via})` : "";
+        const ir = data.result?.ir || {};
+        const logs = data.result?.smoke?.logs || [];
+        const model = data.model || "unknown-model";
+        const reqId = data.oai_request_id || "n/a";
+        const took = (data.took_ms ?? 0) > 0 ? `${data!.took_ms}ms` : "n/a";
+        const via = data.via ? ` (${data.via})` : "";
 
         const fileEntries = Object.entries(bundle);
         const totalBytes = fileEntries.reduce((acc, [, c]) => acc + new TextEncoder().encode(String(c ?? "")).length, 0);
@@ -201,23 +201,20 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
           push("");
         }
 
-        // --- DEBUG SECTION (raw OpenAI output) ---
-        if (data?.debug_payload || data?.debug_raw_openai) {
+        if (data.debug_payload || data.debug_raw_openai) {
           push("### OpenAI Debug");
           if (data.debug_payload) {
             const dp = String(data.debug_payload);
-            const clip = dp.length > MAX_DEBUG_CHARS ? dp.slice(0, MAX_DEBUG_CHARS) + "… (truncated)" : dp;
             push("**Parsed payload (string)**");
             push("```json");
-            push(clip);
+            push(dp.slice(0, MAX_DEBUG_CHARS) + (dp.length > MAX_DEBUG_CHARS ? "… (truncated)" : ""));
             push("```");
           }
           if (data.debug_raw_openai) {
             const dr = String(data.debug_raw_openai);
-            const clip = dr.length > MAX_DEBUG_CHARS ? dr.slice(0, MAX_DEBUG_CHARS) + "… (truncated)" : dr;
             push("**Raw OpenAI response (as returned)**");
             push("```json");
-            push(clip);
+            push(dr.slice(0, MAX_DEBUG_CHARS) + (dr.length > MAX_DEBUG_CHARS ? "… (truncated)" : ""));
             push("```");
           }
         }
@@ -226,13 +223,11 @@ export function useSendHandler(opts: UseSendHandlerOpts) {
 
         const transcript = lines.join("\n");
 
-        // 5) Simulated streaming: repeatedly overwrite assistant bubble
         let i = 0;
         const step = Math.min(25, Math.max(10, Math.floor(transcript.length / 120)));
         const tick = () => {
           if (i >= transcript.length) return;
-          const next = transcript.slice(0, i + step);
-          renderAssistant(next);
+          renderAssistant(transcript.slice(0, i + step));
           i += step;
           setTimeout(tick, 10);
         };
