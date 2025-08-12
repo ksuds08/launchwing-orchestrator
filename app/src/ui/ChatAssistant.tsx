@@ -7,6 +7,8 @@ type ChatAssistantProps = {
   onInitGreeting?: (startGreeting: () => void) => void;
 };
 
+//test//
+
 export default function ChatAssistant({ onReady, onInitGreeting }: ChatAssistantProps) {
   const {
     ideas,
