@@ -5,8 +5,7 @@ export interface Env {
   CLOUDFLARE_API_TOKEN?: string;
   CLOUDFLARE_ACCOUNT_ID?: string;
 
-  // Generators / routing
-  AGENT_URL?: string; // https://launchwing-agent.onrender.com
+  // Direct OpenAI usage (no external agent)
   OPENAI_API_KEY?: string;
   OPENAI_MODEL?: string;
   ORCHESTRATOR_URL?: string; // public URL; used by generated apps’ _worker.ts
