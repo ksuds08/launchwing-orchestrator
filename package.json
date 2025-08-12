@@ -1,22 +1,18 @@
 {
   "name": "launchwing-orchestrator",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "workspaces": ["app"],
   "scripts": {
-    "build": "npm run build -w app && npm run postbuild",
-    "postbuild": "rm -rf public && mkdir -p public && cp -r app/dist/* public/",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint . || true"
+    "fmt": "prettier -w ."
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "4.20240725.0",
-    "typescript": "5.5.4",
-    "eslint": "9.9.0"
-  },
-  "engines": {
-    "node": ">=20"
+    "@cloudflare/workers-types": "^4.20240821.0",
+    "typescript": "^5.5.4",
+    "wrangler": "^3.78.10",
+    "prettier": "^3.3.3"
   }
 }
