@@ -24,6 +24,13 @@ jobs:
       - name: Build orchestrator (ok if no-op)
         run: npm run -w . build || true
 
+      # ✅ FIX: ensure wrangler.toml [assets] points to an existing dir
+      - name: Ensure assets directory exists for [assets]
+        run: |
+          mkdir -p public
+          test -f public/index.html || echo "<!doctype html><meta charset=utf-8><title>LaunchWing Orchestrator</title>OK" > public/index.html
+          ls -la public
+
       - name: Deploy Worker with commit variables
         uses: cloudflare/wrangler-action@v3
         with:
