@@ -1,0 +1,2 @@
+name = "launchwing-app"
+pages_build_output_dir = "app/dist"
