@@ -5,6 +5,15 @@
 import { useCallback, useRef } from "react";
 import { postJSON } from "../lib/api";
 
+
+
+// 1) Give this build a loud version tag
+const LW_UI_REV = "ui-mvp-debug-3";
+
+// 2) Expose it globally so you can check in DevTools Console
+//    (type:  __LW_BUILD  and you should see the string)
+(globalThis as any).__LW_BUILD = LW_UI_REV;
+
 type ChatRole = "system" | "user" | "assistant";
 type ChatMsg = { role: ChatRole; content: string };
 
