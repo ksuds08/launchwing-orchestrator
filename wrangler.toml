@@ -1,13 +1,14 @@
 name = "launchwing-orchestrator"
 main = "src/index.ts"
-compatibility_date = "2025-08-10"
-
-[assets]
-directory = "public"
-binding = "ASSETS"
+compatibility_date = "2025-08-01"
+compatibility_flags = ["transformstream_enable_standard_constructor"]
 
 [vars]
-# Non-secret vars (safe to commit)
-CF_WORKERS_SUBDOMAIN = "promptpulse"
-# Make sandbox deploys default to Cloudflare Pages (Advanced Mode)
-DEFAULT_DEPLOY_MODE = "pages"
+# These are set at deploy time (see workflow), but you can override locally:
+GIT_REF = "dev"
+GIT_SHA = "local"
+
+[observability]
+enabled = true
+
+# For local dev, you can put values in .dev.vars
