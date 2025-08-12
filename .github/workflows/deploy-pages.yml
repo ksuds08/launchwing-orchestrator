@@ -25,12 +25,11 @@ jobs:
       - name: Build SPA → app/dist
         run: npm run -w app build
 
-      # 🔧 Inject Pages Advanced Mode worker (handles OPTIONS + proxies /api/*)
-      - name: Write _worker.js (Pages Advanced proxy with CORS)
+      # Inject Pages Advanced Mode worker (proxies /api/*, handles OPTIONS+CORS)
+      - name: Write _worker.js (Advanced proxy)
         run: |
           cat > app/dist/_worker.js <<'JS'
           const ORCH = "https://launchwing-orchestrator.promptpulse.workers.dev";
-
           function corsHeaders() {
             return {
               "Access-Control-Allow-Origin": "*",
@@ -39,17 +38,12 @@ jobs:
               "Vary": "Origin",
             };
           }
-
           function corsPreflight() {
             return new Response(null, { status: 204, headers: corsHeaders() });
           }
-
           async function serveSPA(req, env) {
-            // Try exact asset
             const res = await env.ASSETS.fetch(req);
             if (res.status !== 404) return res;
-
-            // SPA fallback to /index.html for GET/HEAD + HTML
             const accepts = req.headers.get("accept") || "";
             const isGetLike = req.method === "GET" || req.method === "HEAD";
             if (isGetLike && accepts.includes("text/html")) {
@@ -60,52 +54,32 @@ jobs:
             }
             return res;
           }
-
           export default {
             async fetch(req, env) {
               const url = new URL(req.url);
-
-              // Handle API routes (and preflight)
               if (url.pathname.startsWith("/api/")) {
                 if (req.method === "OPTIONS") return corsPreflight();
-
                 const upstream = new URL(url.pathname.replace(/^\/api/, ""), ORCH);
                 upstream.search = url.search;
-
                 const init = {
                   method: req.method,
                   headers: req.headers,
                   body: (req.method === "GET" || req.method === "HEAD") ? undefined : req.body,
                   redirect: "manual",
                 };
-
                 const r = await fetch(upstream.toString(), init);
-
                 const h = new Headers(r.headers);
                 for (const [k, v] of Object.entries(corsHeaders())) h.set(k, v);
-
                 return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
               }
-
-              // Static/SPA
               return serveSPA(req, env);
             },
           };
           JS
-
           test -f app/dist/_worker.js || (echo "ERROR: app/dist/_worker.js missing" && exit 1)
 
-      # 📝 Provide a Pages-only Wrangler config so Wrangler doesn't warn about pages_build_output_dir
-      - name: Write wrangler.pages.toml
-        run: |
-          cat > wrangler.pages.toml <<'TOML'
-          name = "launchwing-app"
-          pages_build_output_dir = "app/dist"
-          TOML
-          test -f wrangler.pages.toml || (echo "ERROR: wrangler.pages.toml missing" && exit 1)
-
-      # Idempotent project creation (ok if it already exists)
-      - name: Create Pages project if missing
+      # Create Pages project if it doesn't exist (idempotent)
+      - name: Ensure Pages project exists
         continue-on-error: true
         uses: cloudflare/wrangler-action@v3
         with:
@@ -117,23 +91,32 @@ jobs:
             --production-branch main
             --compatibility-date 2024-11-01
 
-      # 🚀 Deploy with retry + explicit config to avoid reading root wrangler.toml
-      - name: Deploy to Pages (Advanced Mode, with retry)
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          for i in 1 2 3; do
-            echo "Attempt $i to deploy Pages…"
-            npx wrangler --config wrangler.pages.toml \
-              pages deploy app/dist \
-              --project-name "${CF_PAGES_PROJECT}" \
-              --branch main \
-              --commit-dirty=true && break || true
-            sleep $((i*10))
-          done
-          if [ "${i:-3}" -eq 3 ]; then
-            echo "❌ Pages deploy failed after 3 attempts"
-            exit 1
-          fi
+      # Deploy with built-in action (no custom --config)
+      - name: Deploy to Pages (Advanced Mode)
+        id: deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4"
+          command: >
+            --cwd app
+            pages deploy dist
+            --project-name ${{ env.CF_PAGES_PROJECT }}
+            --branch main
+            --commit-dirty=true
+
+      # Simple retry once if the API flakes (e.g., 503)
+      - name: Retry deploy once on failure
+        if: failure()
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4"
+          command: >
+            --cwd app
+            pages deploy dist
+            --project-name ${{ env.CF_PAGES_PROJECT }}
+            --branch main
+            --commit-dirty=true
