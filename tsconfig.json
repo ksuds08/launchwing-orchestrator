@@ -1,22 +1,16 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
+    "target": "ES2021",
     "module": "ESNext",
+    "lib": ["ES2021", "WebWorker"],
     "moduleResolution": "Bundler",
     "strict": true,
-    "noEmit": true,
-
-    "lib": ["ES2022"],                      // avoid lib.dom collisions
-    "types": ["@cloudflare/workers-types"], // Workers runtime types
-    "skipLibCheck": true,                   // ignore lib type conflicts
-
-    "baseUrl": ".",
+    "types": ["@cloudflare/workers-types"],
+    "baseUrl": "./src",
     "paths": {
-      "@api/*": ["src/api/*"],
-      "@gen/*": ["src/generation/*"],
-      "@utils/*": ["src/utils/*"],
-      "@t/*": ["src/types/*"]
+      "@utils/*": ["utils/*"],
+      "@api/*": ["api/*"]
     }
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*"]
 }
