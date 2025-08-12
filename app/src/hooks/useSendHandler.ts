@@ -1,5 +1,5 @@
 // app/src/hooks/useSendHandler.ts
-// Calls /api/mvp?debug=1 and SIMULATES streaming by overwriting the assistant message.
+// Calls /api/mvp?debug=1 and SIMULATES streaming by overwriting the assistant message. test.
 // Renders plan + code previews + OpenAI debug payloads (truncated).
 
 import { useCallback, useRef } from "react";
