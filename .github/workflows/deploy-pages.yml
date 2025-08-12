@@ -65,14 +65,10 @@ jobs:
             async fetch(req, env) {
               const url = new URL(req.url);
 
-              // Handle API routes
+              // Handle API routes (and preflight)
               if (url.pathname.startsWith("/api/")) {
-                // Respond to preflight at the edge (avoid upstream 405)
-                if (req.method === "OPTIONS") {
-                  return corsPreflight();
-                }
+                if (req.method === "OPTIONS") return corsPreflight();
 
-                // Proxy to orchestrator
                 const upstream = new URL(url.pathname.replace(/^\/api/, ""), ORCH);
                 upstream.search = url.search;
 
@@ -85,7 +81,6 @@ jobs:
 
                 const r = await fetch(upstream.toString(), init);
 
-                // Add permissive CORS on the way back (harmless for same-origin)
                 const h = new Headers(r.headers);
                 for (const [k, v] of Object.entries(corsHeaders())) h.set(k, v);
 
@@ -100,7 +95,16 @@ jobs:
 
           test -f app/dist/_worker.js || (echo "ERROR: app/dist/_worker.js missing" && exit 1)
 
-      # Idempotent project creation
+      # 📝 Provide a Pages-only Wrangler config so Wrangler doesn't warn about pages_build_output_dir
+      - name: Write wrangler.pages.toml
+        run: |
+          cat > wrangler.pages.toml <<'TOML'
+          name = "launchwing-app"
+          pages_build_output_dir = "app/dist"
+          TOML
+          test -f wrangler.pages.toml || (echo "ERROR: wrangler.pages.toml missing" && exit 1)
+
+      # Idempotent project creation (ok if it already exists)
       - name: Create Pages project if missing
         continue-on-error: true
         uses: cloudflare/wrangler-action@v3
@@ -113,16 +117,23 @@ jobs:
             --production-branch main
             --compatibility-date 2024-11-01
 
-      # Deploy (Pages auto-detects _worker.js and switches to Advanced Mode)
-      - name: Publish to Pages (Advanced Mode)
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          wranglerVersion: "4"
-          command: >
-            --cwd app
-            pages deploy dist
-            --project-name ${{ env.CF_PAGES_PROJECT }}
-            --branch main
-            --commit-dirty=true
+      # 🚀 Deploy with retry + explicit config to avoid reading root wrangler.toml
+      - name: Deploy to Pages (Advanced Mode, with retry)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            echo "Attempt $i to deploy Pages…"
+            npx wrangler --config wrangler.pages.toml \
+              pages deploy app/dist \
+              --project-name "${CF_PAGES_PROJECT}" \
+              --branch main \
+              --commit-dirty=true && break || true
+            sleep $((i*10))
+          done
+          if [ "${i:-3}" -eq 3 ]; then
+            echo "❌ Pages deploy failed after 3 attempts"
+            exit 1
+          fi
