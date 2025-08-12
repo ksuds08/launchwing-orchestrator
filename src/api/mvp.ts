@@ -3,6 +3,10 @@ import { json as log } from "../utils/log";
 import { sanitizeGeneratedFiles } from "../utils/sanitizeGeneratedFiles";
 import { ensureRepo, pushFilesWithContentsAPI } from "../utils/github";
 
+/**
+ * Generate IR + files directly via OpenAI (no external agent service).
+ * We use the Responses API and coerce the model to return strict JSON.
+ */
 export async function mvpHandler(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const stream = url.searchParams.get("stream") === "true";
@@ -18,7 +22,9 @@ export async function mvpHandler(request: Request, env: Env): Promise<Response> 
       try {
         await write(writer, { step: "start", message: "Starting MVP generation…" });
 
-        const agent = await callAgent(env, input, (msg) => write(writer, { step: "agent", message: msg }));
+        const agent = await callOpenAI(env, input, (msg) =>
+          write(writer, { step: "openai", message: msg })
+        );
 
         await write(writer, { step: "sanitize", message: "Sanitizing files…" });
         const appName = (agent.ir?.name || `app-${tag}`).replace(/[^\w-]/g, "-").toLowerCase();
@@ -28,7 +34,10 @@ export async function mvpHandler(request: Request, env: Env): Promise<Response> 
         await write(writer, { step: "repo", message: `Ensuring repo ${repoName}…` });
         await ensureRepo(env, repoName, true);
 
-        await write(writer, { step: "push", message: `Pushing ${Object.keys(files).length} files…` });
+        await write(writer, {
+          step: "push",
+          message: `Pushing ${Object.keys(files).length} files…`
+        });
         const repoUrl = await pushFilesWithContentsAPI(
           env,
           repoName,
@@ -57,7 +66,7 @@ export async function mvpHandler(request: Request, env: Env): Promise<Response> 
   }
 
   // Non-streaming path
-  const agent = await callAgent(env, input);
+  const agent = await callOpenAI(env, input);
   const appName = (agent.ir?.name || `app-${tag}`).replace(/[^\w-]/g, "-").toLowerCase();
   const files = sanitizeGeneratedFiles(env, agent.files || {}, appName);
   const repoName = appName;
@@ -73,34 +82,124 @@ export async function mvpHandler(request: Request, env: Env): Promise<Response> 
   return respond({ ok: true, repoUrl, repoName, ir: agent.ir });
 }
 
-async function callAgent(
+async function callOpenAI(
   env: Env,
   body: MvpRequest,
   onTick?: (msg: string) => void
 ): Promise<MvpResult> {
-  const AGENT = env.AGENT_URL || "https://launchwing-agent.onrender.com";
-  const url = `${AGENT.replace(/\/$/, "")}/generate-batch`;
+  if (!env.OPENAI_API_KEY) throw new Error("Missing env: OPENAI_API_KEY");
+  const model = env.OPENAI_MODEL || "gpt-4o-mini";
 
-  onTick?.("Contacting generation agent…");
-  const res = await fetch(url, {
+  const system = [
+    "You are LaunchWing's generation engine.",
+    "Return a SINGLE JSON object, no prose, no markdown.",
+    "Shape:",
+    "{",
+    '  "ir": {',
+    '    "name": string,',
+    '    "app_type": "spa_api" | "spa" | "api",',
+    '    "pages"?: string[],',
+    '    "api_routes"?: Array<{ method: string; path: string }>,',
+    '    "notes"?: string',
+    "  },",
+    '  "files": { "<path>": "<utf8 file contents>" }',
+    "}",
+    "Constraints:",
+    "- Keep the scaffold minimal and production-capable.",
+    "- Prefer a Vite SPA (index.html + basic entry) unless the idea clearly needs API routes.",
+    "- DO NOT include code fences or backticks.",
+    "- Avoid huge binaries; no images or node_modules.",
+    "- Paths must be POSIX style."
+  ].join("\n");
+
+  const user = {
+    idea: body.idea ?? "",
+    ideaId: body.ideaId ?? "",
+    branding: body.branding ?? {},
+    thread: body.thread ?? []
+  };
+
+  onTick?.("Calling OpenAI…");
+  const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${env.OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.3,
+      top_p: 1,
+      input: [
+        { role: "system", content: system },
+        { role: "user", content: JSON.stringify(user) }
+      ]
+    })
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Agent ${res.status}: ${text.slice(0, 200)}`);
+    throw new Error(`OpenAI ${res.status}: ${text.slice(0, 400)}`);
   }
-  onTick?.("Agent responded.");
+  onTick?.("OpenAI responded.");
 
-  const data = (await res.json()) as MvpResult | any;
-  // Coerce shape defensively
-  const ir = data.ir || data.plan || { name: body.idea?.slice(0, 24) || "launchwing-app", app_type: "spa" };
-  const files = data.files || data.output?.files || {};
-  const smoke = data.smoke || { passed: true, logs: [] };
+  const j = await res.json();
+  const text = extractOutputText(j);
+  const parsed = safeParseJson(text);
+
+  const ir =
+    parsed?.ir ||
+    ({ name: (body.idea || "launchwing-app").slice(0, 24), app_type: "spa" } as MvpResult["ir"]);
+  const files = parsed?.files || {};
+  const smoke = { passed: true, logs: [] as string[] };
 
   return { ir, files, smoke };
+}
+
+/** Try several shapes the Responses API may return; fall back to common fields. */
+function extractOutputText(j: any): string {
+  if (!j) return "";
+  // Newer format
+  if (typeof j.output_text === "string") return j.output_text;
+  // Older content list
+  if (Array.isArray(j.output)) {
+    const parts = j.output
+      .map((p: any) => {
+        if (typeof p.text === "string") return p.text;
+        if (Array.isArray(p.content)) {
+          return p.content.map((c: any) => c.text || "").join("");
+        }
+        return "";
+      })
+      .join("");
+    if (parts) return parts;
+  }
+  // Fallbacks
+  if (Array.isArray(j.content) && j.content[0]?.text) return j.content[0].text;
+  return typeof j === "string" ? j : JSON.stringify(j);
+}
+
+/** Strict JSON parse with fallback to first balanced {...} block. */
+function safeParseJson(raw: string): any | null {
+  const s = raw?.trim();
+  if (!s) return null;
+
+  try {
+    return JSON.parse(s);
+  } catch {
+    // Attempt to slice the first balanced JSON object
+    const start = s.indexOf("{");
+    const end = s.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      const slice = s.slice(start, end + 1);
+      try {
+        return JSON.parse(slice);
+      } catch {
+        // no-op
+      }
+    }
+  }
+  return null;
 }
 
 async function write(writer: WritableStreamDefaultWriter, obj: unknown) {
