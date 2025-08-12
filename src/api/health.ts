@@ -6,9 +6,9 @@ export async function healthHandler(_req: Request, env: Env) {
     time: new Date().toISOString(),
     git: { ref: env.GIT_REF, sha: env.GIT_SHA },
     env: {
+      openai: !!env.OPENAI_API_KEY,
       github: !!env.GITHUB_TOKEN && !!env.GITHUB_ORG,
       cloudflare: !!env.CLOUDFLARE_API_TOKEN && !!env.CLOUDFLARE_ACCOUNT_ID,
-      agent: !!env.AGENT_URL,
       orchestrator_url: env.ORCHESTRATOR_URL || null
     }
   };
