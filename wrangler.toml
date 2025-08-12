@@ -1,7 +1,6 @@
 name = "launchwing-orchestrator"
 main = "src/index.ts"
 compatibility_date = "2025-08-01"
-compatibility_flags = ["transformstream_enable_standard_constructor"]
 
 [vars]
 # These are set at deploy time (see workflow), but you can override locally:
